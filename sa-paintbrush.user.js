@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         SuperAnnotate — Paintbrush tool
+// @name         SuperAnnotate — Paintbrush & Eraser
 // @namespace    superannotate-mods
-// @version      0.1.0
-// @description  Adds a left-panel tool group (Paintbrush + placeholder) and a right-panel settings tab. The paintbrush progressively unions brush stamps into a polygon of the current class, simplifies it with Ramer-Douglas-Peucker on release, merges it with overlapping same-class polygons, and commits one undo step.
+// @version      0.2.0
+// @description  Adds a left-panel tool group (Paintbrush + Eraser) and a right-panel settings tab. Both build a stroke by progressively unioning brush stamps and simplify it with Ramer-Douglas-Peucker on release. The brush then unions the stroke into overlapping polygons of the selected class; the eraser subtracts it from them, splitting a polygon into distinct polygons where the stroke cuts across it. Each stroke is one undo step.
 // @match        https://app.superannotate.com/editor/*
 // @run-at       document-idle
 // @grant        none
@@ -45,7 +45,8 @@
     const LS_KEY = 'sa-paintbrush-settings';
 
     const DEFAULTS = {
-        brushSize: 30, // diameter, in image pixels
+        brushSize: 30,  // diameter, in image pixels
+        eraserSize: 30, // diameter, in image pixels
     };
 
     const BRUSH_MIN = 2;
@@ -54,6 +55,9 @@
     /** Minimum pointer travel (as a fraction of the brush radius) before a new
      *  capsule is stamped. Keeps the progressive union from doing useless work. */
     const RESAMPLE_FRACTION = 0.35;
+
+    /** Destructive-action red, deliberately unlike any class colour. */
+    const ERASER_COLOR = '#ff4d4f';
 
     /** RDP tolerance: scaled off the brush radius, floored so a deep zoom still
      *  removes sub-pixel noise, and capped so big brushes stay recognisable. */
@@ -263,10 +267,73 @@
         return simplified.concat([[simplified[0][0], simplified[0][1]]]);
     }
 
+    /** Perimeter of a closed ring. */
+    function ringPerimeter(ring) {
+        let total = 0;
+        for (let i = 0; i < ring.length - 1; i++) {
+            total += Math.hypot(ring[i + 1][0] - ring[i][0], ring[i + 1][1] - ring[i][1]);
+        }
+        return total;
+    }
+
+    /**
+     * Half the average width of a ring (area / perimeter). Below this a shape is
+     * a hairline: invisible on screen, but it can still carry enough AREA to
+     * pass an area-only filter — a 200x0.2px strip left behind by an erase has
+     * area 40. Measured values: that strip 0.10, a genuine 2px-wide annotation
+     * 0.98, a 200x200 square 50. 0.25 (= half a pixel wide) sits safely between
+     * "no human drew this" and anything legitimate.
+     */
+    const MIN_HALF_WIDTH = 0.25;
+
+    /** Is this ring too small or too thin to be a real annotation? */
+    function isDegenerateRing(ring, minArea) {
+        if (ring.length - 1 < 3) return true;
+        const area = ringArea(ring);
+        if (area < minArea) return true;
+        const perimeter = ringPerimeter(ring);
+        return perimeter > 0 && area / perimeter < MIN_HALF_WIDTH;
+    }
+
+    /**
+     * Anything smaller than this is stroke noise rather than an annotation.
+     * Mirrors the editor's own clip mode, which drops sub-unit slivers
+     * (cutter.ts:81 filters the difference result on area > 1).
+     */
+    function minAreaFor(epsilon) {
+        return Math.max(1, epsilon * epsilon * 4);
+    }
+
+    /**
+     * Drop degenerate rings and sub-threshold pieces WITHOUT running RDP.
+     *
+     * The eraser needs this rather than simplifyMultiPolygon: the stroke is
+     * already simplified before the subtraction, so the cut edge is smooth, and
+     * re-simplifying the whole remainder would also chew up the untouched parts
+     * of a carefully drawn polygon.
+     */
+    function pruneMultiPolygon(mp, epsilon) {
+        const minArea = minAreaFor(epsilon);
+        const out = [];
+
+        for (const poly of mp) {
+            if (!poly.length) continue;
+            const outer = closeRing(poly[0]);
+            if (isDegenerateRing(outer, minArea)) continue;
+
+            const rings = [outer];
+            for (let i = 1; i < poly.length; i++) {
+                const hole = closeRing(poly[i]);
+                if (isDegenerateRing(hole, minArea)) continue;
+                rings.push(hole);
+            }
+            out.push(rings);
+        }
+        return out;
+    }
+
     function simplifyMultiPolygon(mp, epsilon) {
-        // Anything smaller than the simplification tolerance is brush noise.
-        // Mirrors the editor's own clip mode, which drops sub-unit slivers.
-        const minArea = Math.max(1, epsilon * epsilon * 4);
+        const minArea = minAreaFor(epsilon);
         const out = [];
 
         for (const poly of mp) {
@@ -274,15 +341,14 @@
 
             // Outer ring: prefer the simplified form, fall back to the original
             // rather than throwing the polygon away.
-            let outer = simplifyRing(poly[0], epsilon) || closeRing(poly[0]);
-            if (outer.length - 1 < 3) continue;
-            if (ringArea(outer) < minArea) continue;
+            const outer = simplifyRing(poly[0], epsilon) || closeRing(poly[0]);
+            if (isDegenerateRing(outer, minArea)) continue;
 
             const rings = [outer];
             for (let i = 1; i < poly.length; i++) {
                 const hole = simplifyRing(poly[i], epsilon);
-                if (!hole) continue;                       // collapsed -> drop
-                if (ringArea(hole) < minArea) continue;    // sub-tolerance -> drop
+                if (!hole) continue;                          // collapsed -> drop
+                if (isDegenerateRing(hole, minArea)) continue; // noise -> drop
                 rings.push(hole);
             }
             out.push(rings);
@@ -416,32 +482,57 @@
             id: 'paintbrush',
             name: 'Paintbrush',
             shortcut: 'B',
+            mode: 'add',
+            sizeKey: 'brushSize',
             icon: '<path d="M7.5 14.5c-1.6 0-2.9 1.3-2.9 2.9 0 1.3-1.1 1.7-1.6 1.8 1 1.1 2.4 1.8 4 1.8 2.2 0 4-1.8 4-4 0-1.4-1.1-2.5-2.5-2.5z"/>'
                 + '<path d="M20.7 4.3a2 2 0 0 0-2.8 0l-7.5 8.1c-.3.3-.3.4-.1.6l1.6 1.6c.2.2.3.2.6-.1l8.1-7.5a2 2 0 0 0 .1-2.7z"/>',
             settings: ['brushSize'],
         },
         {
-            id: 'placeholder',
-            name: 'Placeholder',
-            shortcut: null,
-            icon: '<path d="M12 3.5 4 8v8l8 4.5 8-4.5V8l-8-4.5zm0 2.3 5.9 3.3L12 12.4 6.1 9.1 12 5.8zM6 10.8l5 2.8v5.6l-5-2.8v-5.6zm7 8.4v-5.6l5-2.8v5.6l-5 2.8z"/>',
-            settings: [],
+            id: 'eraser',
+            name: 'Eraser',
+            shortcut: 'E',
+            mode: 'subtract',
+            sizeKey: 'eraserSize',
+            icon: '<path d="M8.6 20H5.4l-2-2a2.1 2.1 0 0 1 0-3l8.4-8.4a2.1 2.1 0 0 1 3 0l4.2 4.2a2.1 2.1 0 0 1 0 3L12.6 20zm-2.4-2h1.6l4.1-4.1-4.2-4.2-3.7 3.7a.6.6 0 0 0 0 .9z"/>'
+                + '<path d="M13 20h7v2h-7z"/>',
+            settings: ['eraserSize'],
         },
     ];
 
-    const SETTING_DEFS = {
-        brushSize: {
-            label: 'Brush size',
+    const toolById = (id) => TOOLS.find((t) => t.id === id) || null;
+    const isStrokeTool = (id) => !!toolById(id);
+    const activeTool = () => toolById(state.activeToolId);
+
+    /** Radius, in image pixels, of whichever stroke tool is active. */
+    function activeStrokeRadius() {
+        const tool = activeTool();
+        if (!tool) return 0;
+        return (settings[tool.sizeKey] || DEFAULTS[tool.sizeKey]) / 2;
+    }
+
+    /** Every stroke tool's size control is the same shape. */
+    function sizeSetting(key, label) {
+        return {
+            label,
             unit: 'px',
             min: BRUSH_MIN,
             max: BRUSH_MAX,
             step: 1,
-            get: () => settings.brushSize,
+            get: () => settings[key],
             set: (v) => {
-                settings.brushSize = Math.max(BRUSH_MIN, Math.min(BRUSH_MAX, Math.round(v)));
+                const n = Number(v);
+                settings[key] = Number.isFinite(n)
+                    ? Math.max(BRUSH_MIN, Math.min(BRUSH_MAX, Math.round(n)))
+                    : DEFAULTS[key];
                 saveSettings();
             },
-        },
+        };
+    }
+
+    const SETTING_DEFS = {
+        brushSize: sizeSetting('brushSize', 'Brush size'),
+        eraserSize: sizeSetting('eraserSize', 'Eraser size'),
     };
 
     const state = {
@@ -544,7 +635,7 @@
         btn.addEventListener('click', (e) => {
             e.preventDefault();
             e.stopPropagation();
-            activateTool(state.lastPickedId || 'paintbrush');
+            activateTool(state.lastPickedId || TOOLS[0].id);
         });
         btn.addEventListener('contextmenu', (e) => {
             e.preventDefault();
@@ -801,11 +892,15 @@
         document.addEventListener('keydown', (e) => {
             if (e.key === 'Escape' && state.activeToolId) {
                 deactivateTool();
-            } else if ((e.key === 'b' || e.key === 'B') && !e.ctrlKey && !e.metaKey && !e.altKey) {
+            } else if (!e.ctrlKey && !e.metaKey && !e.altKey) {
                 const tag = (e.target && e.target.tagName) || '';
                 if (tag === 'INPUT' || tag === 'TEXTAREA' || (e.target && e.target.isContentEditable)) return;
-                e.preventDefault();
-                activateTool('paintbrush');
+                const key = e.key.toUpperCase();
+                const tool = TOOLS.find((t) => t.shortcut === key);
+                if (tool) {
+                    e.preventDefault();
+                    activateTool(tool.id);
+                }
             }
         }, true);
     }
@@ -846,8 +941,8 @@
         // NOTE: the svg's class attribute is Angular-bound ([attr.class]="svgClass + ...")
         // and is rewritten on every tool change, so the cursor goes on inline style,
         // which nothing in the app touches.
-        svg.style.cursor = state.activeToolId === 'paintbrush' ? 'none' : '';
-        if (state.activeToolId !== 'paintbrush') {
+        svg.style.cursor = isStrokeTool(state.activeToolId) ? 'none' : '';
+        if (!isStrokeTool(state.activeToolId)) {
             const c = svg.querySelector('#sa-pb-cursor');
             if (c) c.remove();
         }
@@ -864,10 +959,13 @@
             c.setAttribute('vector-effect', 'non-scaling-stroke');
             g.appendChild(c);
         }
+        const tool = activeTool();
+        const subtract = tool && tool.mode === 'subtract';
         c.setAttribute('cx', x);
         c.setAttribute('cy', y);
-        c.setAttribute('r', settings.brushSize / 2);
-        c.setAttribute('stroke', currentClassColor() || '#7c5cff');
+        c.setAttribute('r', activeStrokeRadius());
+        c.setAttribute('stroke', subtract ? ERASER_COLOR : (currentClassColor() || '#7c5cff'));
+        c.setAttribute('stroke-dasharray', subtract ? '4 3' : 'none');
     }
 
     function multiPolygonToPathData(mp) {
@@ -881,7 +979,7 @@
         return d;
     }
 
-    function renderStrokePreview(svg, mp) {
+    function renderStrokePreview(svg, mp, mode) {
         const g = ensureOverlay(svg);
         let path = svg.querySelector('#sa-pb-preview');
         if (!path) {
@@ -892,10 +990,14 @@
             path.setAttribute('vector-effect', 'non-scaling-stroke');
             g.insertBefore(path, g.firstChild);
         }
-        const color = currentClassColor() || '#7c5cff';
+        // The eraser is destructive, so it must not look like the class it is
+        // cutting into - red, dashed, and lighter fill.
+        const subtract = mode === 'subtract';
+        const color = subtract ? ERASER_COLOR : (currentClassColor() || '#7c5cff');
         path.setAttribute('fill', color);
-        path.setAttribute('fill-opacity', '0.45');
+        path.setAttribute('fill-opacity', subtract ? '0.25' : '0.45');
         path.setAttribute('stroke', color);
+        path.setAttribute('stroke-dasharray', subtract ? '5 4' : 'none');
         path.setAttribute('d', mp && mp.length ? multiPolygonToPathData(mp) : '');
     }
 
@@ -940,7 +1042,8 @@
     }
 
     function onMouseDown(e) {
-        if (state.activeToolId !== 'paintbrush') return;
+        const tool = activeTool();
+        if (!tool) return;
         if (e.button !== 0) return;       // leave middle-drag pan / right-click menu alone
         if (!overCanvas(e)) return;
         const svg = getSvg();
@@ -952,9 +1055,12 @@
         const p = toImagePoint(svg, e.clientX, e.clientY);
         if (!p) return;
 
-        const radius = settings.brushSize / 2;
         state.stroke = {
-            radius,
+            toolId: tool.id,
+            mode: tool.mode,
+            radius: activeStrokeRadius(),
+            // Captured once, at mousedown: getDrawClassesId() can return a
+            // freshly derived "empty class" id that changes between calls.
             classId: app.svc.getDrawClassesId(),
             last: p,
             pending: [],
@@ -962,13 +1068,13 @@
             rafId: 0,
         };
 
-        // Seed with a single dot so a click (no drag) still paints.
+        // Seed with a single dot so a click (no drag) still marks.
         state.stroke.pending.push([p[0], p[1], p[0], p[1]]);
         scheduleStrokeFlush(svg);
     }
 
     function onMouseMove(e) {
-        if (state.activeToolId !== 'paintbrush') return;
+        if (!isStrokeTool(state.activeToolId)) return;
         const svg = getSvg();
         if (!svg) return;
 
@@ -1032,7 +1138,7 @@
             WARN('union failed for this frame, skipping', err);
             return;
         }
-        renderStrokePreview(svg, stroke.geom);
+        renderStrokePreview(svg, stroke.geom, stroke.mode);
     }
 
     /** The pointer left the page entirely - finish the stroke where it stands. */
@@ -1079,43 +1185,146 @@
 
     // ------------------------------------------------------------- commit
 
-    function commitStroke(stroke) {
-        const svc = app.svc;
-        const pc = app.pc;
-        if (!svc || !pc) return;
-
-        // 1. Simplify with RDP. Tolerance scales with the brush so a fat stroke
-        //    does not carry hundreds of near-collinear vertices.
-        const zoom = svc.zoomLevel || 1;
-        const epsilon = Math.max(
+    /**
+     * RDP tolerance for a stroke. Scales with the tool radius so a fat stroke
+     * does not carry hundreds of near-collinear vertices, with a zoom-derived
+     * floor borrowed from the editor's own simplifyRange (editor-polygon.ts:211).
+     */
+    function strokeEpsilon(stroke) {
+        const zoom = (app.svc && app.svc.zoomLevel) || 1;
+        return Math.max(
             SIMPLIFY.min,
             Math.min(SIMPLIFY.max, Math.max(stroke.radius * SIMPLIFY.radiusFactor, 0.8 / Math.sqrt(zoom)))
         );
+    }
 
-        let geom = simplifyMultiPolygon(stroke.geom, epsilon);
-        if (!geom.length) return;
-
-        // 2. Union with every overlapping, visible polygon of the same class.
-        const strokeBox = multiPolygonBBox(geom);
-        const classId = stroke.classId;
-
-        const candidates = (svc.objects || []).filter((o) =>
+    /**
+     * Both tools act on the selected class only: the brush merges into these,
+     * the eraser subtracts from these, and nothing else on the canvas is
+     * touched.
+     *
+     * Note `locked` is deliberately NOT filtered on. EditorPolygon defaults it
+     * to true for any polygon built without an explicit flag
+     * (editor-polygon.ts:39), so most existing annotations are locked and
+     * skipping them would make the eraser useless.
+     */
+    function sameClassPolygons(svc, classId) {
+        return (svc.objects || []).filter((o) =>
             o && o.type === 'polygon' && !o.isHole && o.classId === classId &&
             o.visible !== false && Array.isArray(o.points) && o.points.length >= 6
         );
+    }
 
+    /**
+     * One polygon-clipping member -> one editor annotation object.
+     *
+     * `donor` is the existing polygon this piece descends from, if any. The
+     * first piece reuses its id so selection and history stay attached; split
+     * siblings get fresh ids but inherit everything else, because they are
+     * fragments of the same annotation.
+     */
+    function polygonJson(poly, opts) {
+        const points = ringToPoints(poly[0]);
+        if (points.length < 6) return null;
+
+        const exclude = [];
+        for (let h = 1; h < poly.length; h++) {
+            const hole = ringToPoints(poly[h]);
+            if (hole.length >= 6) exclude.push(hole);
+        }
+
+        const donor = opts.donor;
+        const keepId = opts.keepId && donor;
+
+        return {
+            id: keepId ? donor.id : uuidv4(),
+            type: 'polygon',
+            classId: opts.classId,
+            probability: donor && typeof donor.probability === 'number' ? donor.probability : 100,
+            points,
+            exclude,
+            groupId: (donor && donor.groupId) || 0,
+            pointLabels: {},
+            locked: donor ? !!donor.locked : false,
+            attributes: donor && donor.attributes ? donor.attributes.map((a) => ({ ...a })) : [],
+            error: donor ? donor.error : null,
+            createdAt: (donor && donor.createdAt) || opts.now,
+            createdBy: (donor && donor.createdBy) || opts.author,
+            creationType: (donor && donor.creationType) || 'Manual',
+            updatedAt: opts.now,
+            updatedBy: opts.author,
+        };
+    }
+
+    /**
+     * The single write path for both tools.
+     *
+     * Rebuilds the annotation as plain JSON, swaps the affected polygons for
+     * the result, hands it back through setObjects, and records exactly ONE
+     * history snapshot. Undo replays setObjects(previousSnapshot), so one press
+     * restores the state from before the stroke began.
+     *
+     * Returns false (writing nothing, and adding no history entry) when the
+     * stroke changed nothing — otherwise undo would need a wasted press.
+     */
+    function applyObjectChanges(change) {
+        const svc = app.svc;
+        if (!change.removedIds.size && !change.added.length) return false;
+
+        inNgZone(() => {
+            const json = svc.getObjectsJson(true);
+            const next = json.filter((o) => !change.removedIds.has(o.id));
+            for (const obj of change.added) next.push(obj);
+
+            svc.setObjects(next);
+
+            // Brand-new polygons with no donor get the class's default
+            // attributes, exactly as the editor does for its own fresh shapes.
+            if (change.defaultAttrIds && change.defaultAttrIds.size) {
+                for (const o of svc.objects) {
+                    if (change.defaultAttrIds.has(o.id) && typeof o.setDefaultAttributes === 'function') {
+                        try { o.setDefaultAttributes(); } catch (err) { /* noop */ }
+                    }
+                }
+            }
+
+            svc.addToHistory();
+        });
+        return true;
+    }
+
+    function commitStroke(stroke) {
+        if (!app.svc || !app.pc) return;
+        const epsilon = strokeEpsilon(stroke);
+
+        // Simplify the STROKE, before any boolean op. Doing it here rather than
+        // on the result means existing polygons keep their original vertices —
+        // only the newly cut or newly painted edge is smoothed.
+        const geom = simplifyMultiPolygon(stroke.geom, epsilon);
+        if (!geom.length) return;
+
+        if (stroke.mode === 'subtract') commitEraserStroke(stroke, geom, epsilon);
+        else commitBrushStroke(stroke, geom, epsilon);
+    }
+
+    /** Paintbrush: union the stroke with every overlapping same-class polygon. */
+    function commitBrushStroke(stroke, strokeGeom, epsilon) {
+        const svc = app.svc;
+        const pc = app.pc;
+        const classId = stroke.classId;
+
+        let geom = strokeGeom;
+        const strokeBox = multiPolygonBBox(geom);
         const merged = [];
-        for (const obj of candidates) {
+
+        for (const obj of sameClassPolygons(svc, classId)) {
             let objGeom;
-            try {
-                objGeom = editorPolygonToGeom(obj);
-            } catch (err) { continue; }
+            try { objGeom = editorPolygonToGeom(obj); } catch (err) { continue; }
             if (!boxesOverlap(strokeBox, multiPolygonBBox([objGeom]), 1)) continue;
             try {
-                // bbox overlap is only a broad phase; require real intersection
-                // so a disjoint neighbour is never rewritten.
-                const hit = pc.intersection(geom, objGeom);
-                if (!hit || !hit.length) continue;
+                // bbox overlap is only a broad phase; require a real
+                // intersection so a disjoint neighbour is never rewritten.
+                if (!pc.intersection(geom, objGeom).length) continue;
                 geom = pc.union(geom, objGeom);
                 merged.push(obj);
             } catch (err) {
@@ -1125,73 +1334,97 @@
 
         if (!geom.length) return;
 
-        // 3. Rebuild the annotation as plain JSON, swap the merged polygons for
-        //    the result, hand it back through setObjects, and record ONE history
-        //    snapshot. Undo then replays setObjects(previousSnapshot).
-        inNgZone(() => {
-            const json = svc.getObjectsJson(true);
-            const removed = new Set(merged.map((o) => o.id));
-            const next = json.filter((o) => !removed.has(o.id));
+        const now = new Date().toISOString();
+        const author = svc.me ? { email: svc.me.id, roleId: svc.me.role && svc.me.role.id } : null;
+        const donor = merged[0] || null;
+        const added = [];
+        const defaultAttrIds = new Set();
 
-            const donor = merged[0] || null;
-            const now = new Date().toISOString();
-            const author = svc.me ? { email: svc.me.id, roleId: svc.me.role && svc.me.role.id } : null;
-            const newIds = [];
-
-            geom.forEach((poly, i) => {
-                const points = ringToPoints(poly[0]);
-                if (points.length < 6) return;
-
-                const exclude = [];
-                for (let h = 1; h < poly.length; h++) {
-                    const hole = ringToPoints(poly[h]);
-                    if (hole.length >= 6) exclude.push(hole);
-                }
-
-                // Reuse the first merged polygon's identity so selection,
-                // grouping and attributes survive the merge (same trick the
-                // editor's own clip mode uses in cutter.ts).
-                const reuse = i === 0 && donor;
-                const id = reuse ? donor.id : uuidv4();
-                if (!reuse) newIds.push(id);
-
-                next.push({
-                    id,
-                    type: 'polygon',
-                    classId,
-                    probability: 100,
-                    points,
-                    exclude,
-                    groupId: reuse ? donor.groupId || 0 : 0,
-                    pointLabels: {},
-                    locked: reuse ? !!donor.locked : false,
-                    attributes: reuse && donor.attributes ? donor.attributes.map((a) => ({ ...a })) : [],
-                    error: reuse ? donor.error : null,
-                    createdAt: reuse && donor.createdAt ? donor.createdAt : now,
-                    createdBy: reuse && donor.createdBy ? donor.createdBy : author,
-                    creationType: 'Manual',
-                    updatedAt: now,
-                    updatedBy: author,
-                });
+        geom.forEach((poly, i) => {
+            const json = polygonJson(poly, {
+                classId,
+                donor: i === 0 ? donor : null,
+                keepId: i === 0,
+                now,
+                author,
             });
-
-            svc.setObjects(next);
-
-            // Brand-new polygons get the class's default attributes, exactly as
-            // the editor does for its own freshly drawn shapes.
-            if (newIds.length) {
-                const wanted = new Set(newIds);
-                for (const o of svc.objects) {
-                    if (wanted.has(o.id) && typeof o.setDefaultAttributes === 'function') {
-                        try { o.setDefaultAttributes(); } catch (err) { /* noop */ }
-                    }
-                }
-            }
-
-            svc.addToHistory();
+            if (!json) return;
+            if (!(i === 0 && donor)) defaultAttrIds.add(json.id);
+            added.push(json);
         });
 
-        LOG(`committed: ${geom.length} polygon(s), merged ${merged.length}, eps=${epsilon.toFixed(2)}`);
+        const wrote = applyObjectChanges({
+            removedIds: new Set(merged.map((o) => o.id)),
+            added,
+            defaultAttrIds,
+        });
+        if (wrote) LOG(`brush: ${added.length} polygon(s), merged ${merged.length}, eps=${epsilon.toFixed(2)}`);
+    }
+
+    /**
+     * Eraser: subtract the stroke from every overlapping same-class polygon.
+     *
+     * A subtraction can return zero members (the polygon was wholly erased),
+     * one member (a bite was taken out of it), or several (the stroke cut
+     * across it) — in which case each member becomes its own distinct polygon.
+     * Holes come back on each member and are carried through as `exclude`.
+     */
+    function commitEraserStroke(stroke, strokeGeom, epsilon) {
+        const svc = app.svc;
+        const pc = app.pc;
+        const classId = stroke.classId;
+        const strokeBox = multiPolygonBBox(strokeGeom);
+
+        const now = new Date().toISOString();
+        const author = svc.me ? { email: svc.me.id, roleId: svc.me.role && svc.me.role.id } : null;
+
+        const removedIds = new Set();
+        const added = [];
+        let erased = 0;
+        let splits = 0;
+
+        for (const obj of sameClassPolygons(svc, classId)) {
+            let objGeom;
+            try { objGeom = editorPolygonToGeom(obj); } catch (err) { continue; }
+            if (!boxesOverlap(strokeBox, multiPolygonBBox([objGeom]), 1)) continue;
+
+            let remainder;
+            try {
+                if (!pc.intersection(strokeGeom, objGeom).length) continue; // untouched
+                remainder = pc.difference(objGeom, strokeGeom);
+            } catch (err) {
+                WARN('erase skipped for object', obj.id, err);
+                continue;
+            }
+
+            // Prune only — no RDP. The stroke was already simplified, so the cut
+            // edge is clean, and re-simplifying here would also degrade the
+            // parts of this polygon the eraser never touched.
+            const pieces = pruneMultiPolygon(remainder, epsilon);
+
+            // Either way this polygon is replaced: removed outright when nothing
+            // survives, or swapped for its remaining piece(s).
+            removedIds.add(obj.id);
+            if (!pieces.length) { erased++; continue; }
+            if (pieces.length > 1) splits++;
+
+            pieces.forEach((poly, i) => {
+                const json = polygonJson(poly, {
+                    classId,
+                    donor: obj,        // every piece descends from this polygon
+                    keepId: i === 0,   // the first keeps its identity
+                    now,
+                    author,
+                });
+                if (json) added.push(json);
+            });
+        }
+
+        const wrote = applyObjectChanges({ removedIds, added, defaultAttrIds: null });
+        if (wrote) {
+            LOG(`eraser: ${removedIds.size} polygon(s) hit, ${erased} removed, ` +
+                `${splits} split, ${added.length} remaining piece(s), eps=${epsilon.toFixed(2)}`);
+        }
     }
 
     // ---------------------------------------------------------------- boot
