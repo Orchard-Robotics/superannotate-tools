@@ -49,10 +49,17 @@ right panel.
   left-clicking outside the image (or switching tools, or <kbd>Esc</kbd>)
   discards it.
 
-**Tool settings** holds brush and eraser sizes, and for Fill by Color the
-**Threshold** (0–255, GIMP's scale) and **Select by** criterion — Composite,
-Red, Green, Blue, HSV Hue, HSV Saturation and HSV Value. Settings are
-remembered between sessions.
+**Tool settings** holds brush and eraser sizes, and for Fill by Color:
+
+- **Select by** — Composite, Red, Green, Blue, HSV Hue, HSV Saturation or
+  HSV Value, matching GIMP's selection criteria.
+- **Threshold** — 0–255, GIMP's scale.
+- **Fill Gap Threshold** — grows the selection by this many pixels then shrinks
+  it back by the same amount (a morphological closing). Bridges gaps and fills
+  pinholes up to roughly twice the value across, while leaving the outline of
+  anything larger where it was. 0 disables it.
+
+Settings are remembered between sessions.
 
 **Switching tools** — right-click or click-and-hold the tool button (or the
 **Tool settings** tab) to open the tool menu, the same gesture the editor's own
@@ -66,6 +73,10 @@ Shortcuts are <kbd>Shift</kbd>-based because every bare letter is already bound
 by the editor itself.
 
 Runs on `https://app.superannotate.com/editor/*`.
+
+The gap radius is counted in pixels of the image the editor loads, which for
+large images is a downscaled rendition — so at high zoom one step of the slider
+may cover more than one screen pixel.
 
 #### Fill by Color requirements
 

@@ -53,6 +53,7 @@
         eraserSize: 30, // diameter, in image pixels
         fillThreshold: 15,          // GIMP's default, 0..255
         fillCriterion: 'composite', // GIMP's GimpSelectCriterion
+        fillGap: 0,                 // grow-then-shrink radius, in source pixels
     };
 
     const BRUSH_MIN = 2;
@@ -562,6 +563,158 @@
     }
 
     /*
+     * Grow / shrink, after GIMP's gimpoperationgrow.c.
+     *
+     * GIMP's structuring element is an ellipse, built per column as
+     *     circ[i] = RINT (yradius / xradius * sqrt (SQR (xradius) - SQR (tmp)))
+     * which for equal radii is a disk. Applying it directly costs O(W*H*r), too
+     * slow to re-run on every drag of a slider, so we get the same disk from an
+     * exact Euclidean distance transform instead: grow is "within r of a set
+     * pixel", shrink is "further than r from a clear pixel". That is O(W*H) for
+     * any radius.
+     *
+     * The one deviation from GIMP: its RINT rounds the ellipse outward at some
+     * offsets, so its kernel is up to a pixel fatter than a true circle. We use
+     * the exact circle, d^2 <= r^2.
+     *
+     * Edges are handled by REPLICATE padding rather than by GIMP's zero-pad,
+     * because a closing needs both halves to agree about what lies outside:
+     *
+     *   - zero-padding everywhere pulls a region that is flush with the image
+     *     border back from it by r, which is visible and wrong;
+     *   - treating out of bounds as set ("edge lock") is worse - once a dilated
+     *     mask reaches the border there are no clear pixels left to erode
+     *     against, so a blob merely NEAR the edge gets sucked out to it.
+     *
+     * Replicating the border pixels gives the right answer in both cases: a
+     * flush region stays flush, an interior blob is restored exactly. The pad
+     * is 2r wide, because eroding an original pixel reads dilated values up to
+     * r away, and those in turn read source pixels up to r beyond that.
+     */
+
+    /** Copy `mask` into a (w+2*pad) x (h+2*pad) buffer, replicating the edges. */
+    function padMaskReplicate(mask, width, height, pad) {
+        const pw = width + 2 * pad;
+        const ph = height + 2 * pad;
+        const out = new Uint8Array(pw * ph);
+        for (let y = 0; y < ph; y++) {
+            const sy = Math.min(height - 1, Math.max(0, y - pad));
+            const srcRow = sy * width;
+            const dstRow = y * pw;
+            for (let x = 0; x < pw; x++) {
+                const sx = Math.min(width - 1, Math.max(0, x - pad));
+                out[dstRow + x] = mask[srcRow + sx];
+            }
+        }
+        return { mask: out, width: pw, height: ph };
+    }
+
+    /** Inverse of padMaskReplicate. */
+    function cropMask(mask, width, height, pad, outWidth, outHeight) {
+        const out = new Uint8Array(outWidth * outHeight);
+        for (let y = 0; y < outHeight; y++) {
+            const srcRow = (y + pad) * width + pad;
+            out.set(mask.subarray(srcRow, srcRow + outWidth), y * outWidth);
+        }
+        return out;
+    }
+
+    /**
+     * Exact squared Euclidean distance transform (Felzenszwalb & Huttenlocher).
+     * `seed[i] === seedValue` marks a source; every other cell gets the squared
+     * distance to the nearest source. Runs one 1-D pass down the columns, then
+     * one across the rows.
+     */
+    function squaredDistanceTransform(seed, width, height, seedValue) {
+        const INF = 1e20;
+        const grid = new Float64Array(width * height);
+        for (let i = 0; i < grid.length; i++) grid[i] = seed[i] === seedValue ? 0 : INF;
+
+        const n = Math.max(width, height);
+        const f = new Float64Array(n);
+        const d = new Float64Array(n);
+        const v = new Int32Array(n);
+        const z = new Float64Array(n + 1);
+
+        // 1-D lower envelope of parabolas, in place over f[0..len)
+        const pass = (len) => {
+            let k = 0;
+            v[0] = 0;
+            z[0] = -INF;
+            z[1] = INF;
+            for (let q = 1; q < len; q++) {
+                let s = ((f[q] + q * q) - (f[v[k]] + v[k] * v[k])) / (2 * q - 2 * v[k]);
+                while (s <= z[k]) {
+                    k--;
+                    s = ((f[q] + q * q) - (f[v[k]] + v[k] * v[k])) / (2 * q - 2 * v[k]);
+                }
+                k++;
+                v[k] = q;
+                z[k] = s;
+                z[k + 1] = INF;
+            }
+            k = 0;
+            for (let q = 0; q < len; q++) {
+                while (z[k + 1] < q) k++;
+                const dq = q - v[k];
+                d[q] = dq * dq + f[v[k]];
+            }
+        };
+
+        for (let x = 0; x < width; x++) {
+            for (let y = 0; y < height; y++) f[y] = grid[y * width + x];
+            pass(height);
+            for (let y = 0; y < height; y++) grid[y * width + x] = d[y];
+        }
+        for (let y = 0; y < height; y++) {
+            const row = y * width;
+            for (let x = 0; x < width; x++) f[x] = grid[row + x];
+            pass(width);
+            for (let x = 0; x < width; x++) grid[row + x] = d[x];
+        }
+        return grid;
+    }
+
+    /** Dilate by a disk of `radius` pixels. */
+    function growMask(mask, width, height, rawRadius) {
+        const radius = Math.max(0, Math.round(rawRadius) || 0);
+        if (radius <= 0) return mask;
+        const dist = squaredDistanceTransform(mask, width, height, 1);
+        const rr = radius * radius;
+        const out = new Uint8Array(mask.length);
+        for (let i = 0; i < out.length; i++) out[i] = dist[i] <= rr ? 1 : 0;
+        return out;
+    }
+
+    /** Erode by a disk of `radius` pixels. */
+    function shrinkMask(mask, width, height, rawRadius) {
+        const radius = Math.max(0, Math.round(rawRadius) || 0);
+        if (radius <= 0) return mask;
+        const dist = squaredDistanceTransform(mask, width, height, 0);
+        const rr = radius * radius;
+        const out = new Uint8Array(mask.length);
+        for (let i = 0; i < out.length; i++) out[i] = mask[i] === 1 && dist[i] > rr ? 1 : 0;
+        return out;
+    }
+
+    /**
+     * Morphological closing: grow then shrink by the same radius. Bridges gaps
+     * and fills pinholes up to about 2*radius across, while leaving the outline
+     * of anything larger where it was.
+     */
+    function closeMaskGaps(mask, width, height, rawRadius) {
+        // A pixel count: anything fractional would give padMaskReplicate a
+        // fractional buffer length, which TypedArray rejects outright.
+        const radius = Math.max(0, Math.round(rawRadius) || 0);
+        if (radius <= 0) return mask;
+        const pad = 2 * radius;
+        const p = padMaskReplicate(mask, width, height, pad);
+        const grown = growMask(p.mask, p.width, p.height, radius);
+        const shrunk = shrinkMask(grown, p.width, p.height, radius);
+        return cropMask(shrunk, p.width, p.height, pad, width, height);
+    }
+
+    /*
      * Raster mask -> closed rings, by following pixel "cracks".
      *
      * For every selected pixel, each side facing an unselected pixel becomes one
@@ -716,8 +869,11 @@
     }
 
     /** Seed colour + settings -> polygons in annotation coordinates. */
-    function colorSelectPolygons(bitmap, seed, threshold, criterion, epsilon, scaleX, scaleY) {
-        const mask = buildColorMask(bitmap, seed, threshold, criterion);
+    function colorSelectPolygons(bitmap, seed, threshold, criterion, gap, epsilon, scaleX, scaleY) {
+        let mask = buildColorMask(bitmap, seed, threshold, criterion);
+        // Close gaps BEFORE tracing, so the vector outline already reflects the
+        // bridged shape rather than being patched up afterwards.
+        mask = closeMaskGaps(mask, bitmap.width, bitmap.height, gap);
         const rings = traceMaskRings(mask, bitmap.width, bitmap.height);
         const polys = scalePolygons(ringsToPolygons(rings), scaleX, scaleY);
         return simplifyMultiPolygon(polys, epsilon);
@@ -773,7 +929,7 @@
             kind: 'pick',
             icon: '<path d="M11.1 3.5 9.7 4.9l1.7 1.7-6.1 6.1a1.8 1.8 0 0 0 0 2.5l3.9 3.9a1.8 1.8 0 0 0 2.5 0l6.1-6.1a1.8 1.8 0 0 0 0-2.5L11.1 3.5zm1.7 4.5 3.9 3.9H8.9l3.9-3.9z"/>'
                 + '<path d="M19.5 15.2s-1.8 2-1.8 3a1.8 1.8 0 1 0 3.6 0c0-1-1.8-3-1.8-3z"/>',
-            settings: ['fillCriterion', 'fillThreshold'],
+            settings: ['fillCriterion', 'fillThreshold', 'fillGap'],
         },
     ];
 
@@ -824,6 +980,22 @@
                 settings.fillThreshold = Number.isFinite(n)
                     ? Math.max(0, Math.min(255, Math.round(n)))
                     : DEFAULTS.fillThreshold;
+                saveSettings();
+            },
+        },
+        fillGap: {
+            type: 'range',
+            label: 'Fill Gap Threshold',
+            unit: 'px',
+            min: 0,
+            max: 40,
+            step: 1,
+            get: () => settings.fillGap,
+            set: (v) => {
+                const n = Number(v);
+                settings.fillGap = Number.isFinite(n)
+                    ? Math.max(0, Math.min(40, Math.round(n)))
+                    : DEFAULTS.fillGap;
                 saveSettings();
             },
         },
@@ -2051,7 +2223,7 @@
         try {
             fill.geom = colorSelectPolygons(
                 bitmap, fill.seed, settings.fillThreshold, settings.fillCriterion,
-                epsilon, scale.x, scale.y
+                settings.fillGap, epsilon, scale.x, scale.y
             );
             fill.error = null;
         } catch (err) {
@@ -2060,7 +2232,7 @@
             fill.error = 'Colour selection failed: ' + err.message;
         }
         LOG(`fill preview: ${fill.geom.length} region(s) in ${Date.now() - t0}ms ` +
-            `(threshold ${settings.fillThreshold}, ${settings.fillCriterion})`);
+            `(threshold ${settings.fillThreshold}, ${settings.fillCriterion}, gap ${settings.fillGap})`);
 
         renderFillPreview();
         updateFillNote();
