@@ -46348,6 +46348,8 @@ const _EditorScreen = class _EditorScreen {
      * 8-pixel hit area so picking small points stays easy.
      */
     __publicField(this, "keypointSize", 5);
+    // Colour painted over pixels the isolation toggle hides.
+    __publicField(this, "cutoutColor", "#000000");
     __publicField(this, "darkModeCanvas", null);
     __publicField(this, "darkModeCacheKey", "");
     __publicField(this, "showClassesOnHover", true);
@@ -47470,6 +47472,15 @@ const _EditorScreen = class _EditorScreen {
                                 <input type="checkbox" id="editor-adjust-image-darkmode" />
                                 <span>Image Dark Mode</span>
                             </label>
+                            <div class="editor-adjust-sep"></div>
+                            <div class="editor-adjust-row">
+                                <label class="editor-adjust-label" for="editor-adjust-cutout-color">Cutout Color <span class="editor-adjust-label-hint" title="Saved as your personal preference on localStorage for this device">(saved locally)</span></label>
+                                <div class="editor-adjust-color-wrap">
+                                    <input type="color" id="editor-adjust-cutout-color" class="editor-adjust-color" value="#000000" aria-label="Cutout color" title="Colour used where the isolation toggle hides the image" />
+                                    <span class="editor-adjust-value" id="editor-adjust-cutout-color-value">#000000</span>
+                                    <button type="button" class="editor-adjust-color-reset" id="editor-adjust-cutout-color-reset" title="Reset to black">Reset</button>
+                                </div>
+                            </div>
                         </div>
                     </div>
                     <button type="button" class="editor-btn" id="editor-fullscreen-btn" aria-label="Toggle fullscreen" title="Toggle fullscreen (F)"><span class="editor-btn-icon" id="editor-fullscreen-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 3 21 3 21 9"/><polyline points="9 21 3 21 3 15"/><line x1="21" y1="3" x2="14" y2="10"/><line x1="3" y1="21" x2="10" y2="14"/></svg></span></button>
@@ -47634,6 +47645,7 @@ const _EditorScreen = class _EditorScreen {
     this.overlayCtx = this.overlayCanvas.getContext("2d");
     this.bindToolbar(root);
     this.initKeypointSize();
+    this.initCutoutColor();
     this.bindAdjustControls(root);
     this.bindImagePanelToggle(root);
     this.bindAnnotationPanelToggle(root);
@@ -47694,6 +47706,29 @@ const _EditorScreen = class _EditorScreen {
     this.bindPanelEvents(root);
     this.initTheme();
     void this.processPendingSources();
+  }
+  initCutoutColor() {
+    const fallback = _EditorScreen.CUTOUT_COLOR_DEFAULT;
+    let raw = null;
+    try {
+      raw = localStorage.getItem(_EditorScreen.CUTOUT_COLOR_KEY);
+    } catch {
+    }
+    if (raw == null) {
+      this.cutoutColor = fallback;
+      return;
+    }
+    // <input type="color"> only ever emits #rrggbb; anything else is a stale
+    // or hand-edited value and is discarded rather than fed to the canvas.
+    if (/^#[0-9a-fA-F]{6}$/.test(raw)) {
+      this.cutoutColor = raw.toLowerCase();
+    } else {
+      this.cutoutColor = fallback;
+      try {
+        localStorage.removeItem(_EditorScreen.CUTOUT_COLOR_KEY);
+      } catch {
+      }
+    }
   }
   initKeypointSize() {
     const raw = localStorage.getItem(_EditorScreen.KEYPOINT_SIZE_KEY);
@@ -70771,6 +70806,29 @@ const _EditorScreen = class _EditorScreen {
         this.drawOverlay();
       });
     }
+    const cutoutInput = root.querySelector("#editor-adjust-cutout-color");
+    const cutoutValue = root.querySelector("#editor-adjust-cutout-color-value");
+    const cutoutReset = root.querySelector("#editor-adjust-cutout-color-reset");
+    if (cutoutInput) {
+      const applyCutoutColor = (value, persist) => {
+        const next = /^#[0-9a-fA-F]{6}$/.test(value) ? value.toLowerCase() : _EditorScreen.CUTOUT_COLOR_DEFAULT;
+        this.cutoutColor = next;
+        cutoutInput.value = next;
+        if (cutoutValue) cutoutValue.textContent = next;
+        if (persist) {
+          try {
+            localStorage.setItem(_EditorScreen.CUTOUT_COLOR_KEY, next);
+          } catch {
+          }
+        }
+        this.drawOverlay();
+      };
+      applyCutoutColor(this.cutoutColor, false);
+      cutoutInput.addEventListener("input", () => applyCutoutColor(cutoutInput.value, true));
+      if (cutoutReset) {
+        cutoutReset.addEventListener("click", () => applyCutoutColor(_EditorScreen.CUTOUT_COLOR_DEFAULT, true));
+      }
+    }
   }
   counterRotate(ctx, cx, cy, fn) {
     if (this.viewport.rotation === 0) {
@@ -71909,17 +71967,11 @@ const _EditorScreen = class _EditorScreen {
     this.updateSam2TrackingPopup();
   }
   /**
-   * Backdrop used to blank out hidden pixels. Sampled from the live DOM so it
-   * matches whatever theme the app is in, rather than being hard-coded.
+   * Colour painted over pixels the isolation toggle hides. Chosen by the user
+   * in global settings (Cutout Color); black by default.
    */
   getIsolationBackdrop() {
-    let node = this.overlayCanvas ? this.overlayCanvas.parentElement : null;
-    while (node) {
-      const bg = window.getComputedStyle(node).backgroundColor;
-      if (bg && bg !== "transparent" && !/^rgba\(0,\s*0,\s*0,\s*0\)$/.test(bg)) return bg;
-      node = node.parentElement;
-    }
-    return "#14161a";
+    return this.cutoutColor || _EditorScreen.CUTOUT_COLOR_DEFAULT;
   }
   /**
    * An offscreen canvas at image resolution with this instance's region opaque
@@ -72077,6 +72129,8 @@ __publicField(_EditorScreen, "KEYPOINT_SIZE_MIN", 2);
 __publicField(_EditorScreen, "KEYPOINT_SIZE_MAX", 10);
 __publicField(_EditorScreen, "KEYPOINT_SIZE_DEFAULT", 5);
 __publicField(_EditorScreen, "KEYPOINT_SIZE_KEY", "ia-keypoint-size");
+__publicField(_EditorScreen, "CUTOUT_COLOR_DEFAULT", "#000000");
+__publicField(_EditorScreen, "CUTOUT_COLOR_KEY", "ia-cutout-color");
 __publicField(_EditorScreen, "BOX_POLY_OPACITY_DEFAULT", 32);
 __publicField(_EditorScreen, "MASK_OPACITY_DEFAULT", 100);
 /**

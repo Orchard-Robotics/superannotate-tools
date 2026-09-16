@@ -6218,6 +6218,35 @@ hr.editor-info-tooltip-sep {
     margin-left: 0.25rem;
     cursor: help;
 }
+.editor-adjust-color-wrap {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+}
+.editor-adjust-color {
+    width: 2.25rem;
+    height: 1.75rem;
+    padding: 2px;
+    border: 1px solid var(--n-200);
+    border-radius: var(--radius);
+    cursor: pointer;
+    background: var(--n-0);
+    flex-shrink: 0;
+}
+.editor-adjust-color-reset {
+    margin-left: auto;
+    padding: 0.15rem 0.5rem;
+    font-size: 0.7rem;
+    color: var(--n-600);
+    background: none;
+    border: 1px solid var(--n-200);
+    border-radius: var(--radius);
+    cursor: pointer;
+}
+.editor-adjust-color-reset:hover {
+    color: var(--n-900);
+    border-color: var(--n-400);
+}
 .editor-adjust-slider-wrap {
     display: flex;
     align-items: center;
