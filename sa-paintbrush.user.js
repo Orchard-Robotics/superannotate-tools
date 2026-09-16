@@ -628,13 +628,14 @@
         const btn = document.createElement('button');
         btn.type = 'button';
         btn.className = 'sa-pb-btn has-menu';
-        btn.title = 'Paintbrush  (right-click for more tools)';
+        btn.title = 'Paintbrush  (right-click or click-and-hold for more tools)';
         btn.setAttribute('data-qa-id', 'sa-paintbrush-tool');
         btn.innerHTML = svgIcon(tool.icon);
 
         btn.addEventListener('click', (e) => {
             e.preventDefault();
             e.stopPropagation();
+            if (consumeSuppressedClick()) return;
             activateTool(state.lastPickedId || TOOLS[0].id);
         });
         btn.addEventListener('contextmenu', (e) => {
@@ -642,11 +643,77 @@
             e.stopPropagation();
             openNestedMenu(btn);
         });
+        attachLongPress(btn, () => openNestedMenu(btn));
 
         wrap.appendChild(btn);
         section.appendChild(wrap);
         state.ui.leftButton = btn;
         syncLeftPanel();
+    }
+
+    /**
+     * Port of the app's own MouseLongPressDirective (long-press.directive.ts):
+     * left button only, 500ms, cancelled by a *window* mouseup with the left
+     * button. Notably it is NOT cancelled by movement, so the app lets you press,
+     * hold, slide onto a menu item and release to pick it - which is why the
+     * nested menu items listen for `mouseup` rather than `click`.
+     */
+    const LONG_PRESS_MS = 500;
+
+    function attachLongPress(el, handler) {
+        let timer = 0;
+
+        function onWindowUp(e) {
+            if (e.button) return;
+            cancel();
+        }
+
+        function cancel() {
+            if (timer) { clearTimeout(timer); timer = 0; }
+            window.removeEventListener('mouseup', onWindowUp, true);
+        }
+
+        /**
+         * The press is still held when the menu opens, so a click is coming on
+         * release and must not also toggle the tool. Clear the flag on the next
+         * macrotask after that release: the browser dispatches click
+         * synchronously after mouseup, so the click sees the flag set, and
+         * nothing later can inherit it.
+         *
+         * This has to be driven by mouseup rather than by the click itself -
+         * releasing over a nested menu item fires mouseup on the item and no
+         * click on `el` at all, which would otherwise leave the flag stuck and
+         * swallow the next legitimate click.
+         */
+        function armClickSuppression() {
+            state.suppressNextClick = true;
+            window.addEventListener('mouseup', disarmAfterRelease, true);
+        }
+
+        function disarmAfterRelease(e) {
+            if (e.button) return;
+            window.removeEventListener('mouseup', disarmAfterRelease, true);
+            setTimeout(() => { state.suppressNextClick = false; }, 0);
+        }
+
+        el.addEventListener('mousedown', (e) => {
+            if (e.button) return;                 // left button only
+            cancel();
+            window.addEventListener('mouseup', onWindowUp, true);
+            timer = setTimeout(() => {
+                timer = 0;
+                window.removeEventListener('mouseup', onWindowUp, true);
+                armClickSuppression();
+                handler(e);
+            }, LONG_PRESS_MS);
+        });
+    }
+
+    /** True once, if a long press just fired and its trailing click should die. */
+    function consumeSuppressedClick() {
+        if (!state.suppressNextClick) return false;
+        state.suppressNextClick = false;
+        return true;
     }
 
     function openNestedMenu(anchor) {
@@ -673,8 +740,18 @@
         }
 
         document.body.appendChild(menu);
-        menu.style.left = Math.round(rect.right + 8) + 'px';
-        menu.style.top = Math.round(Math.min(rect.top, window.innerHeight - menu.offsetHeight - 8)) + 'px';
+
+        // Prefer the right of the anchor (left panel), flip to the left when
+        // that would overflow (right panel tab), and clamp vertically.
+        const gap = 8;
+        let left = rect.right + gap;
+        if (left + menu.offsetWidth > window.innerWidth - gap) {
+            left = rect.left - menu.offsetWidth - gap;
+        }
+        menu.style.left = Math.round(Math.max(gap, left)) + 'px';
+        menu.style.top = Math.round(
+            Math.max(gap, Math.min(rect.top, window.innerHeight - menu.offsetHeight - gap))
+        ) + 'px';
 
         state.ui.menu = menu;
         setTimeout(() => {
@@ -732,11 +809,21 @@
         }
         tab.classList.add('sa-pb-tab');
         tab.setAttribute('data-qa-id', 'sa-paintbrush-settings-tab-header');
+        tab.title = 'Tool settings  (right-click or click-and-hold to switch tool)';
         tab.addEventListener('click', (e) => {
             e.preventDefault();
             e.stopPropagation();
+            if (consumeSuppressedClick()) return;
             openSettingsTab();
         }, true);
+        // Same gesture as the left-panel tools: click-and-hold (or right-click)
+        // opens the nested tool menu, so the tool can be switched from here too.
+        tab.addEventListener('contextmenu', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            openNestedMenu(tab);
+        });
+        attachLongPress(tab, () => openNestedMenu(tab));
         labels.appendChild(tab);
 
         const panel = document.createElement('div');
