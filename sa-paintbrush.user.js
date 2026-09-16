@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         SuperAnnotate — Paintbrush & Eraser
+// @name         SuperAnnotate — Paintbrush, Eraser & Fill by Color
 // @namespace    superannotate-mods
-// @version      0.2.0
-// @description  Adds a left-panel tool group (Paintbrush + Eraser) and a right-panel settings tab. Both build a stroke by progressively unioning brush stamps and simplify it with Ramer-Douglas-Peucker on release. The brush then unions the stroke into overlapping polygons of the selected class; the eraser subtracts it from them, splitting a polygon into distinct polygons where the stroke cuts across it. Each stroke is one undo step.
+// @version      0.3.0
+// @description  Adds a tool group (Paintbrush, Eraser, Fill by Color) to the editor's left panel and a Tool settings tab to the right panel. Brush and eraser build a stroke by progressively unioning brush stamps, simplified with Ramer-Douglas-Peucker; the brush unions it into overlapping polygons of the selected class, the eraser subtracts it and splits polygons where it cuts across. Fill by Color is a port of GIMP's Select-by-Color: left-click previews, right-click commits. Every action is one undo step.
 // @match        https://app.superannotate.com/editor/*
 // @run-at       document-idle
 // @grant        none
@@ -31,6 +31,10 @@
  *   objects, getObjectsJson(includeApproval), setObjects(json), addToHistory(),
  *   getDrawClassesId(), getClassById(id), changeTool(toolType), zoomLevel, me
  *
+ * Keyboard shortcuts use Shift+<letter>: every bare letter is already bound
+ * by the editor, and this script's keydown handler runs on document capture,
+ * so a bare letter would shadow the app's own shortcut.
+ *
  * Undo: the editor's history is snapshot based (shared-editor.service.ts:852).
  * One addToHistory() call == one undo step, and undo() -> changeHistory() ->
  * setObjects(previousSnapshot) rebuilds every object. So this script mutates
@@ -47,6 +51,8 @@
     const DEFAULTS = {
         brushSize: 30,  // diameter, in image pixels
         eraserSize: 30, // diameter, in image pixels
+        fillThreshold: 15,          // GIMP's default, 0..255
+        fillCriterion: 'composite', // GIMP's GimpSelectCriterion
     };
 
     const BRUSH_MIN = 2;
@@ -457,6 +463,266 @@
         });
     }
 
+    // ------------------------------------------------- colour selection (raster)
+
+    /*
+     * Ported from GIMP's Select-by-Color (app/tools/gimpbycolorselecttool.c ->
+     * gimp_pickable_contiguous_region_by_color). Two things matter for fidelity:
+     *
+     *  - it is BY COLOUR, not by seed: every pixel in the image within the
+     *    threshold of the clicked colour matches, contiguous or not.
+     *  - the threshold slider is 0..255 but the comparison happens on
+     *    normalised 0..1 channels ("options->threshold / 255.0"), and a pixel
+     *    is IN when `max <= threshold`.
+     */
+
+    const SELECT_CRITERIA = [
+        { value: 'composite', label: 'Composite' },
+        { value: 'red', label: 'Red' },
+        { value: 'green', label: 'Green' },
+        { value: 'blue', label: 'Blue' },
+        { value: 'hue', label: 'HSV Hue' },
+        { value: 'saturation', label: 'HSV Saturation' },
+        { value: 'value', label: 'HSV Value' },
+    ];
+
+    /** GIMP's EPSILON guard on the HSV hue comparison. */
+    const HSV_EPSILON = 1e-6;
+
+    /** r,g,b in 0..255 -> h,s,v in 0..1. */
+    function rgbToHsv(r, g, b, out) {
+        r /= 255; g /= 255; b /= 255;
+        const max = Math.max(r, g, b);
+        const min = Math.min(r, g, b);
+        const d = max - min;
+
+        let h = 0;
+        if (d !== 0) {
+            if (max === r) h = ((g - b) / d) % 6;
+            else if (max === g) h = (b - r) / d + 2;
+            else h = (r - g) / d + 4;
+            h /= 6;
+            if (h < 0) h += 1;
+        }
+        out[0] = h;
+        out[1] = max === 0 ? 0 : d / max;
+        out[2] = max;
+        return out;
+    }
+
+    /**
+     * GIMP's pixel_difference, on normalised 0..1 channels.
+     *
+     * HSV_HUE is the subtle one: when either colour is unsaturated GIMP returns
+     * 10.0 - an effectively infinite difference - so greys never match by hue,
+     * whatever the threshold. Hue also wraps: MIN(d, 1 - d).
+     */
+    function pixelDifference(criterion, a, b, aHsv, bHsv) {
+        switch (criterion) {
+            case 'red':   return Math.abs(a[0] - b[0]) / 255;
+            case 'green': return Math.abs(a[1] - b[1]) / 255;
+            case 'blue':  return Math.abs(a[2] - b[2]) / 255;
+            case 'hue': {
+                if (aHsv[1] <= HSV_EPSILON || bHsv[1] <= HSV_EPSILON) return 10;
+                const d = Math.abs(aHsv[0] - bHsv[0]);
+                return Math.min(d, 1 - d);
+            }
+            case 'saturation': return Math.abs(aHsv[1] - bHsv[1]);
+            case 'value':      return Math.abs(aHsv[2] - bHsv[2]);
+            case 'composite':
+            default: {
+                const dr = Math.abs(a[0] - b[0]);
+                const dg = Math.abs(a[1] - b[1]);
+                const db = Math.abs(a[2] - b[2]);
+                return Math.max(dr, Math.max(dg, db)) / 255;
+            }
+        }
+    }
+
+    /**
+     * Every pixel within `threshold` (0..255) of `seed` under `criterion`.
+     * Returns a Uint8Array mask of width*height.
+     */
+    function buildColorMask(bitmap, seed, threshold, criterion) {
+        const { width, height, data } = bitmap;
+        const mask = new Uint8Array(width * height);
+        const limit = threshold / 255;
+
+        const seedHsv = rgbToHsv(seed[0], seed[1], seed[2], [0, 0, 0]);
+        const px = [0, 0, 0];
+        const pxHsv = [0, 0, 0];
+        const needsHsv = criterion === 'hue' || criterion === 'saturation' || criterion === 'value';
+
+        for (let i = 0, p = 0; i < mask.length; i++, p += 4) {
+            px[0] = data[p]; px[1] = data[p + 1]; px[2] = data[p + 2];
+            if (needsHsv) rgbToHsv(px[0], px[1], px[2], pxHsv);
+            if (pixelDifference(criterion, px, seed, pxHsv, seedHsv) <= limit) mask[i] = 1;
+        }
+        return mask;
+    }
+
+    /*
+     * Raster mask -> closed rings, by following pixel "cracks".
+     *
+     * For every selected pixel, each side facing an unselected pixel becomes one
+     * directed unit edge on the lattice of pixel corners, oriented so the
+     * selected side is always on the edge's right (y points down). Linking those
+     * edges head-to-tail yields closed rings; with this orientation an outer
+     * boundary has positive shoelace area and a hole negative.
+     *
+     * Directions index into DIRS: 0=+x 1=+y 2=-x 3=-y, so a 90 degree turn is
+     * (d+1)%4 and a lattice point holds at most one outgoing edge per direction
+     * - the whole edge set fits in a Map of 4-bit masks.
+     */
+    const DIRS = [[1, 0], [0, 1], [-1, 0], [0, -1]];
+
+    function traceMaskRings(mask, width, height) {
+        const stride = width + 1;
+        const out = new Map(); // latticeKey -> bitmask of outgoing directions
+
+        const add = (x, y, dir) => {
+            const k = y * stride + x;
+            out.set(k, (out.get(k) || 0) | (1 << dir));
+        };
+        const inside = (x, y) =>
+            x >= 0 && y >= 0 && x < width && y < height && mask[y * width + x] === 1;
+
+        for (let y = 0; y < height; y++) {
+            for (let x = 0; x < width; x++) {
+                if (mask[y * width + x] !== 1) continue;
+                if (!inside(x, y - 1)) add(x, y, 0);          // top:    ->  +x
+                if (!inside(x + 1, y)) add(x + 1, y, 1);      // right:  ->  +y
+                if (!inside(x, y + 1)) add(x + 1, y + 1, 2);  // bottom: ->  -x
+                if (!inside(x - 1, y)) add(x, y + 1, 3);      // left:   ->  -y
+            }
+        }
+
+        const rings = [];
+        const keys = Array.from(out.keys()).sort((a, b) => a - b);
+        const limit = width * height * 4 + 16;
+
+        for (const startKey of keys) {
+            const sx = startKey % stride;
+            const sy = (startKey - sx) / stride;
+
+            for (;;) {
+                const startBits = out.get(startKey) || 0;
+                if (!startBits) break;
+
+                let dir = 31 - Math.clz32(startBits & -startBits); // lowest set bit
+                let x = sx;
+                let y = sy;
+                const ring = [];
+                let guard = 0;
+
+                for (;;) {
+                    const k = y * stride + x;
+                    const bits = out.get(k) || 0;
+                    if (!(bits & (1 << dir))) break;      // already walked
+                    out.set(k, bits & ~(1 << dir));
+
+                    ring.push([x, y]);
+                    x += DIRS[dir][0];
+                    y += DIRS[dir][1];
+                    if (x === sx && y === sy) break;       // closed
+
+                    // Preferring a (d+1)%4 turn keeps the foreground
+                    // 4-connected: where two diagonal blobs meet at one lattice
+                    // point it closes the current blob rather than hopping
+                    // across into the other one.
+                    const nextBits = out.get(y * stride + x) || 0;
+                    const order = [(dir + 1) % 4, dir, (dir + 3) % 4, (dir + 2) % 4];
+                    let chosen = -1;
+                    for (const cand of order) {
+                        if (nextBits & (1 << cand)) { chosen = cand; break; }
+                    }
+                    if (chosen === -1) break;              // open chain: bail
+                    dir = chosen;
+                    if (++guard > limit) break;            // never spin
+                }
+
+                if (ring.length >= 4) rings.push(compressRing(ring));
+            }
+        }
+        return rings;
+    }
+
+    /** Collapse runs of collinear unit steps into single segments, then close. */
+    function compressRing(ring) {
+        const out = [];
+        const n = ring.length;
+        for (let i = 0; i < n; i++) {
+            const prev = ring[(i - 1 + n) % n];
+            const cur = ring[i];
+            const next = ring[(i + 1) % n];
+            const ax = cur[0] - prev[0], ay = cur[1] - prev[1];
+            const bx = next[0] - cur[0], by = next[1] - cur[1];
+            if (ax * by - ay * bx !== 0) out.push(cur);    // keep only corners
+        }
+        if (out.length < 3) return ring.concat([[ring[0][0], ring[0][1]]]);
+        return out.concat([[out[0][0], out[0][1]]]);
+    }
+
+    /** Signed shoelace area: positive for an outer ring under our orientation. */
+    function signedRingArea(ring) {
+        let total = 0;
+        for (let i = 0; i < ring.length - 1; i++) {
+            total += ring[i][0] * ring[i + 1][1] - ring[i + 1][0] * ring[i][1];
+        }
+        return total / 2;
+    }
+
+    /** Even-odd point-in-ring test. */
+    function pointInRing(pt, ring) {
+        let inside = false;
+        for (let i = 0, j = ring.length - 2; i < ring.length - 1; j = i++) {
+            const xi = ring[i][0], yi = ring[i][1];
+            const xj = ring[j][0], yj = ring[j][1];
+            if ((yi > pt[1]) !== (yj > pt[1]) &&
+                pt[0] < ((xj - xi) * (pt[1] - yi)) / (yj - yi) + xi) {
+                inside = !inside;
+            }
+        }
+        return inside;
+    }
+
+    /**
+     * Sort traced rings into polygons, nesting each hole inside the smallest
+     * outer ring that contains it.
+     */
+    function ringsToPolygons(rings) {
+        const outers = [];
+        const holes = [];
+        for (const ring of rings) {
+            const area = signedRingArea(ring);
+            if (area > 0) outers.push({ ring, area });
+            else if (area < 0) holes.push(ring);
+        }
+        outers.sort((a, b) => a.area - b.area);   // smallest first
+
+        const polys = outers.map((o) => [o.ring]);
+        for (const hole of holes) {
+            const probe = hole[0];
+            for (let i = 0; i < outers.length; i++) {
+                if (pointInRing(probe, outers[i].ring)) { polys[i].push(hole); break; }
+            }
+        }
+        return polys;
+    }
+
+    /** Bitmap-pixel lattice coordinates -> annotation coordinates. */
+    function scalePolygons(polys, sx, sy) {
+        return polys.map((poly) => poly.map((ring) => ring.map((p) => [p[0] * sx, p[1] * sy])));
+    }
+
+    /** Seed colour + settings -> polygons in annotation coordinates. */
+    function colorSelectPolygons(bitmap, seed, threshold, criterion, epsilon, scaleX, scaleY) {
+        const mask = buildColorMask(bitmap, seed, threshold, criterion);
+        const rings = traceMaskRings(mask, bitmap.width, bitmap.height);
+        const polys = scalePolygons(ringsToPolygons(rings), scaleX, scaleY);
+        return simplifyMultiPolygon(polys, epsilon);
+    }
+
     // -------------------------------------------------------------- settings
 
     const settings = Object.assign({}, DEFAULTS, readSettings());
@@ -481,7 +747,8 @@
         {
             id: 'paintbrush',
             name: 'Paintbrush',
-            shortcut: 'B',
+            shortcut: 'Shift+B',
+            kind: 'stroke',
             mode: 'add',
             sizeKey: 'brushSize',
             icon: '<path d="M7.5 14.5c-1.6 0-2.9 1.3-2.9 2.9 0 1.3-1.1 1.7-1.6 1.8 1 1.1 2.4 1.8 4 1.8 2.2 0 4-1.8 4-4 0-1.4-1.1-2.5-2.5-2.5z"/>'
@@ -491,23 +758,34 @@
         {
             id: 'eraser',
             name: 'Eraser',
-            shortcut: 'E',
+            shortcut: 'Shift+E',
+            kind: 'stroke',
             mode: 'subtract',
             sizeKey: 'eraserSize',
             icon: '<path d="M8.6 20H5.4l-2-2a2.1 2.1 0 0 1 0-3l8.4-8.4a2.1 2.1 0 0 1 3 0l4.2 4.2a2.1 2.1 0 0 1 0 3L12.6 20zm-2.4-2h1.6l4.1-4.1-4.2-4.2-3.7 3.7a.6.6 0 0 0 0 .9z"/>'
                 + '<path d="M13 20h7v2h-7z"/>',
             settings: ['eraserSize'],
         },
+        {
+            id: 'fillByColor',
+            name: 'Fill by Color',
+            shortcut: 'Shift+F',
+            kind: 'pick',
+            icon: '<path d="M11.1 3.5 9.7 4.9l1.7 1.7-6.1 6.1a1.8 1.8 0 0 0 0 2.5l3.9 3.9a1.8 1.8 0 0 0 2.5 0l6.1-6.1a1.8 1.8 0 0 0 0-2.5L11.1 3.5zm1.7 4.5 3.9 3.9H8.9l3.9-3.9z"/>'
+                + '<path d="M19.5 15.2s-1.8 2-1.8 3a1.8 1.8 0 1 0 3.6 0c0-1-1.8-3-1.8-3z"/>',
+            settings: ['fillCriterion', 'fillThreshold'],
+        },
     ];
 
     const toolById = (id) => TOOLS.find((t) => t.id === id) || null;
-    const isStrokeTool = (id) => !!toolById(id);
+    const isStrokeTool = (id) => { const t = toolById(id); return !!t && t.kind === 'stroke'; };
+    const isPickTool = (id) => { const t = toolById(id); return !!t && t.kind === 'pick'; };
     const activeTool = () => toolById(state.activeToolId);
 
     /** Radius, in image pixels, of whichever stroke tool is active. */
     function activeStrokeRadius() {
         const tool = activeTool();
-        if (!tool) return 0;
+        if (!tool || !tool.sizeKey) return 0;
         return (settings[tool.sizeKey] || DEFAULTS[tool.sizeKey]) / 2;
     }
 
@@ -533,6 +811,34 @@
     const SETTING_DEFS = {
         brushSize: sizeSetting('brushSize', 'Brush size'),
         eraserSize: sizeSetting('eraserSize', 'Eraser size'),
+        fillThreshold: {
+            type: 'range',
+            label: 'Threshold',
+            unit: '0-255',
+            min: 0,
+            max: 255,
+            step: 1,
+            get: () => settings.fillThreshold,
+            set: (v) => {
+                const n = Number(v);
+                settings.fillThreshold = Number.isFinite(n)
+                    ? Math.max(0, Math.min(255, Math.round(n)))
+                    : DEFAULTS.fillThreshold;
+                saveSettings();
+            },
+        },
+        fillCriterion: {
+            type: 'select',
+            label: 'Select by',
+            options: SELECT_CRITERIA,
+            get: () => settings.fillCriterion,
+            set: (v) => {
+                settings.fillCriterion = SELECT_CRITERIA.some((c) => c.value === v)
+                    ? v
+                    : DEFAULTS.fillCriterion;
+                saveSettings();
+            },
+        },
     };
 
     const state = {
@@ -587,6 +893,15 @@
         .sa-pb-field-head label { opacity: .8; }
         .sa-pb-field-row { display: flex; align-items: center; gap: 10px; }
         .sa-pb-field-row input[type=range] { flex: 1; accent-color: #7c5cff; }
+        .sa-pb-field-row select {
+            flex: 1; padding: 5px 6px; border-radius: 4px;
+            border: 1px solid rgba(127,127,127,.4);
+            background: var(--sn-color-bg-elevated, rgba(127,127,127,.12)); color: inherit;
+        }
+        .sa-pb-note {
+            margin-top: 4px; padding: 8px 10px; border-radius: 4px; line-height: 1.45;
+            background: rgba(127,127,127,.12); opacity: .85; font-size: 12px;
+        }
         .sa-pb-field-row input[type=number] {
             width: 68px; padding: 4px 6px; border-radius: 4px;
             border: 1px solid rgba(127,127,127,.4); background: transparent; color: inherit;
@@ -896,37 +1211,104 @@
 
             const head = document.createElement('div');
             head.className = 'sa-pb-field-head';
-            head.innerHTML = `<label for="sa-pb-${key}">${def.label}</label><span class="sa-pb-unit">${def.unit || ''}</span>`;
+            head.innerHTML = `<label for="sa-pb-${key}">${def.label}</label>` +
+                `<span class="sa-pb-unit">${def.unit || ''}</span>`;
             field.appendChild(head);
 
             const row = document.createElement('div');
             row.className = 'sa-pb-field-row';
 
-            const range = document.createElement('input');
-            range.type = 'range';
-            range.id = `sa-pb-${key}`;
-            range.min = def.min; range.max = def.max; range.step = def.step;
-            range.value = def.get();
-
-            const number = document.createElement('input');
-            number.type = 'number';
-            number.min = def.min; number.max = def.max; number.step = def.step;
-            number.value = def.get();
-
-            const push = (v) => {
-                def.set(Number(v));
+            if (def.type === 'select') {
+                const select = document.createElement('select');
+                select.id = `sa-pb-${key}`;
+                for (const opt of def.options) {
+                    const o = document.createElement('option');
+                    o.value = opt.value;
+                    o.textContent = opt.label;
+                    select.appendChild(o);
+                }
+                select.value = def.get();
+                select.addEventListener('change', () => {
+                    def.set(select.value);
+                    onSettingChanged();
+                });
+                row.appendChild(select);
+            } else {
+                const range = document.createElement('input');
+                range.type = 'range';
+                range.id = `sa-pb-${key}`;
+                range.min = def.min; range.max = def.max; range.step = def.step;
                 range.value = def.get();
-                number.value = def.get();
-                updateCursor();
-            };
-            range.addEventListener('input', () => push(range.value));
-            number.addEventListener('change', () => push(number.value));
 
-            row.appendChild(range);
-            row.appendChild(number);
+                const number = document.createElement('input');
+                number.type = 'number';
+                number.min = def.min; number.max = def.max; number.step = def.step;
+                number.value = def.get();
+
+                const push = (v) => {
+                    def.set(v);
+                    range.value = def.get();
+                    number.value = def.get();
+                    onSettingChanged();
+                };
+                range.addEventListener('input', () => push(range.value));
+                number.addEventListener('change', () => push(number.value));
+
+                row.appendChild(range);
+                row.appendChild(number);
+            }
+
             field.appendChild(row);
             panel.appendChild(field);
         }
+
+        if (tool.kind === 'pick') {
+            const note = document.createElement('div');
+            note.className = 'sa-pb-note';
+            note.id = 'sa-pb-note';
+            panel.appendChild(note);
+            updateFillNote();
+        }
+    }
+
+    /**
+     * Update the status line in place.
+     *
+     * Deliberately NOT a renderSettings() call: the preview refreshes while the
+     * user drags the threshold slider, and rebuilding the panel would destroy
+     * the very input element being dragged.
+     */
+    function updateFillNote() {
+        const note = document.getElementById('sa-pb-note');
+        if (!note) return;
+        const fill = state.fill;
+        if (fill && fill.error) {
+            note.textContent = fill.error;
+        } else if (fill) {
+            note.textContent = fill.geom.length
+                ? `Preview: ${fill.geom.length} region(s). Right-click the image to fill, ` +
+                  'or left-click elsewhere to discard.'
+                : 'Nothing matched at this threshold. Raise it, or pick another colour.';
+        } else {
+            note.textContent =
+                'Left-click the image to preview what would be filled, then right-click to commit.';
+        }
+    }
+
+    /**
+     * A setting changed. The brush only needs its cursor resized; Fill by Color
+     * has to re-run the selection so the preview tracks the slider live, without
+     * the user re-clicking. Debounced because dragging the threshold slider
+     * fires continuously.
+     */
+    function onSettingChanged() {
+        updateCursor();
+        if (!state.fill) return;
+        if (state.fillDebounce) clearTimeout(state.fillDebounce);
+        state.fillDebounce = setTimeout(() => {
+            state.fillDebounce = 0;
+            recomputeFillPreview();
+        }, 120);
     }
 
     // -------------------------------------------------------- tool lifecycle
@@ -936,6 +1318,7 @@
             deactivateTool();
             return;
         }
+        if (state.activeToolId !== toolId) clearFillPreview();
         state.activeToolId = toolId;
         state.lastPickedId = toolId;
 
@@ -959,6 +1342,7 @@
     function deactivateTool() {
         state.activeToolId = null;
         abortStroke();
+        clearFillPreview();
         syncLeftPanel();
         renderSettings();
         updateCursor();
@@ -979,13 +1363,18 @@
         document.addEventListener('keydown', (e) => {
             if (e.key === 'Escape' && state.activeToolId) {
                 deactivateTool();
-            } else if (!e.ctrlKey && !e.metaKey && !e.altKey) {
+            } else if (e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey) {
                 const tag = (e.target && e.target.tagName) || '';
                 if (tag === 'INPUT' || tag === 'TEXTAREA' || (e.target && e.target.isContentEditable)) return;
-                const key = e.key.toUpperCase();
-                const tool = TOOLS.find((t) => t.shortcut === key);
+                // Shift+<letter>: every bare letter is already taken by the
+                // editor (B=Bucket, E=Ellipse, G=Magic select, ...) and this
+                // handler runs on document capture, so a bare letter here would
+                // silently shadow the app's own shortcut.
+                const want = 'Shift+' + e.key.toUpperCase();
+                const tool = TOOLS.find((t) => t.shortcut === want);
                 if (tool) {
                     e.preventDefault();
+                    e.stopPropagation();
                     activateTool(tool.id);
                 }
             }
@@ -1028,7 +1417,8 @@
         // NOTE: the svg's class attribute is Angular-bound ([attr.class]="svgClass + ...")
         // and is rewritten on every tool change, so the cursor goes on inline style,
         // which nothing in the app touches.
-        svg.style.cursor = isStrokeTool(state.activeToolId) ? 'none' : '';
+        svg.style.cursor = isStrokeTool(state.activeToolId) ? 'none'
+            : isPickTool(state.activeToolId) ? 'crosshair' : '';
         if (!isStrokeTool(state.activeToolId)) {
             const c = svg.querySelector('#sa-pb-cursor');
             if (c) c.remove();
@@ -1114,6 +1504,10 @@
         window.addEventListener('mousemove', onMouseMove, true);
         window.addEventListener('mouseup', onMouseUp, true);
 
+        // Fill by Color commits on right-click, so the browser menu and the
+        // editor's own class menu both have to be held off over the canvas.
+        window.addEventListener('contextmenu', onCanvasContextMenu, true);
+
         // NOT window+capture: mouseleave does not bubble, but it still runs the
         // capture phase on ancestors, so a window capture listener fires for
         // mouseleave on every element in the page - including each existing
@@ -1121,6 +1515,15 @@
         // On `document` in the bubble phase it fires only when the pointer
         // genuinely leaves the page.
         document.addEventListener('mouseleave', onPointerLeftPage);
+    }
+
+    /** Right-click over the image: commit the Fill by Color preview. */
+    function onCanvasContextMenu(e) {
+        if (!isPickTool(state.activeToolId)) return;
+        if (!overCanvas(e)) return;
+        e.preventDefault();
+        e.stopPropagation();
+        if (state.fill && state.fill.geom.length) commitFillPreview();
     }
 
     function overCanvas(e) {
@@ -1142,6 +1545,15 @@
         const p = toImagePoint(svg, e.clientX, e.clientY);
         if (!p) return;
 
+        if (tool.kind === 'pick') {
+            // Inside the image -> preview; outside it -> discard the preview.
+            const vb = svg.viewBox && svg.viewBox.baseVal;
+            const inImage = vb && p[0] >= 0 && p[1] >= 0 && p[0] < vb.width && p[1] < vb.height;
+            if (inImage) startFillPreview(p);
+            else clearFillPreview();
+            return;
+        }
+
         state.stroke = {
             toolId: tool.id,
             mode: tool.mode,
@@ -1161,11 +1573,11 @@
     }
 
     function onMouseMove(e) {
-        if (!isStrokeTool(state.activeToolId)) return;
+        if (!activeTool()) return;
         const svg = getSvg();
         if (!svg) return;
 
-        if (overCanvas(e)) {
+        if (overCanvas(e) && isStrokeTool(state.activeToolId)) {
             const p = toImagePoint(svg, e.clientX, e.clientY);
             if (p) drawCursor(svg, p[0], p[1]);
         }
@@ -1512,6 +1924,207 @@
             LOG(`eraser: ${removedIds.size} polygon(s) hit, ${erased} removed, ` +
                 `${splits} split, ${added.length} remaining piece(s), eps=${epsilon.toFixed(2)}`);
         }
+    }
+
+    // ------------------------------------------------- fill by colour (tool)
+
+    /**
+     * The editor shows the image as a plain <img> inside .imageWrapper, whose
+     * src is the LO-RES rendition (vector-editor.component.html). The SVG
+     * viewBox is in ORIGINAL image coordinates, so the bitmap we sample is
+     * usually smaller than annotation space and everything traced from it has
+     * to be scaled up by viewBox/bitmap.
+     *
+     * Tiled (OpenSeadragon) projects have no such <img> - they render into
+     * #tiledWrapper - so the tool reports that it cannot sample instead of
+     * silently doing nothing.
+     */
+    function findEditorImage() {
+        return document.querySelector('.editor-workspace .imageWrapper img');
+    }
+
+    /**
+     * Pixels for the current image, cached per src.
+     *
+     * The page's own <img> has no crossOrigin attribute, so drawing it to a
+     * canvas would taint it and getImageData would throw. We therefore fetch
+     * the bytes ourselves and decode them - which needs the image host to allow
+     * CORS. A cache-busting param is NOT an option here: these are presigned
+     * URLs and any extra query parameter invalidates the signature.
+     */
+    function loadBitmap() {
+        const img = findEditorImage();
+        if (!img || !img.src) {
+            return Promise.reject(new Error('No image found — tiled projects are not supported yet.'));
+        }
+        const src = img.src;
+        if (app.bitmap && app.bitmap.src === src) return Promise.resolve(app.bitmap);
+        if (app.bitmapPending && app.bitmapPending.src === src) return app.bitmapPending.promise;
+
+        const promise = fetch(src, { mode: 'cors', credentials: 'omit' })
+            .then((r) => {
+                if (!r.ok) throw new Error(`image fetch failed (HTTP ${r.status})`);
+                return r.blob();
+            })
+            .then((blob) => createImageBitmap(blob))
+            .then((bitmap) => {
+                const canvas = document.createElement('canvas');
+                canvas.width = bitmap.width;
+                canvas.height = bitmap.height;
+                const ctx = canvas.getContext('2d', { willReadFrequently: true });
+                ctx.drawImage(bitmap, 0, 0);
+                const imageData = ctx.getImageData(0, 0, bitmap.width, bitmap.height);
+                bitmap.close && bitmap.close();
+
+                app.bitmap = { src, width: imageData.width, height: imageData.height, data: imageData.data };
+                app.bitmapPending = null;
+                LOG(`sampled image ${imageData.width}x${imageData.height}`);
+                return app.bitmap;
+            })
+            .catch((err) => {
+                app.bitmapPending = null;
+                throw new Error(
+                    'Could not read the image pixels (' + err.message + '). ' +
+                    'The image host must allow cross-origin reads.'
+                );
+            });
+
+        app.bitmapPending = { src, promise };
+        return promise;
+    }
+
+    /** SVG viewBox (annotation space) -> bitmap pixel scale factors. */
+    function bitmapScale(svg, bitmap) {
+        const vb = svg.viewBox && svg.viewBox.baseVal;
+        const w = (vb && vb.width) || bitmap.width;
+        const h = (vb && vb.height) || bitmap.height;
+        return { x: w / bitmap.width, y: h / bitmap.height, width: w, height: h };
+    }
+
+    /** Left click on the image: sample the colour there and build a preview. */
+    function startFillPreview(imagePoint) {
+        const svg = getSvg();
+        if (!svg || !app.svc) return;
+
+        loadBitmap().then((bitmap) => {
+            const scale = bitmapScale(svg, bitmap);
+            const col = Math.floor(imagePoint[0] / scale.x);
+            const row = Math.floor(imagePoint[1] / scale.y);
+
+            if (col < 0 || row < 0 || col >= bitmap.width || row >= bitmap.height) {
+                clearFillPreview();   // clicked outside the image
+                return;
+            }
+
+            const p = (row * bitmap.width + col) * 4;
+            state.fill = {
+                seed: [bitmap.data[p], bitmap.data[p + 1], bitmap.data[p + 2]],
+                at: [col, row],
+                classId: app.svc.getDrawClassesId(),
+                geom: [],
+                error: null,
+            };
+            recomputeFillPreview();
+        }).catch((err) => {
+            WARN(err.message);
+            state.fill = { seed: null, at: null, classId: null, geom: [], error: err.message };
+            renderFillPreview();
+            updateFillNote();
+        });
+    }
+
+    /** Re-run the selection for the stored seed with the current settings. */
+    function recomputeFillPreview() {
+        const svg = getSvg();
+        const fill = state.fill;
+        if (!svg || !fill || !fill.seed || !app.bitmap) return;
+
+        const bitmap = app.bitmap;
+        const scale = bitmapScale(svg, bitmap);
+
+        // Tolerance in annotation units: never finer than one source pixel,
+        // since that is the resolution the mask was traced at.
+        const zoom = (app.svc && app.svc.zoomLevel) || 1;
+        const epsilon = Math.max(0.8 / Math.sqrt(zoom), Math.max(scale.x, scale.y) * 0.75);
+
+        const t0 = Date.now();
+        try {
+            fill.geom = colorSelectPolygons(
+                bitmap, fill.seed, settings.fillThreshold, settings.fillCriterion,
+                epsilon, scale.x, scale.y
+            );
+            fill.error = null;
+        } catch (err) {
+            WARN('colour selection failed', err);
+            fill.geom = [];
+            fill.error = 'Colour selection failed: ' + err.message;
+        }
+        LOG(`fill preview: ${fill.geom.length} region(s) in ${Date.now() - t0}ms ` +
+            `(threshold ${settings.fillThreshold}, ${settings.fillCriterion})`);
+
+        renderFillPreview();
+        updateFillNote();
+    }
+
+    function renderFillPreview() {
+        const svg = getSvg();
+        if (!svg) return;
+
+        const g = ensureOverlay(svg);
+        let path = svg.querySelector('#sa-pb-fill-preview');
+        if (!path) {
+            path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+            path.setAttribute('id', 'sa-pb-fill-preview');
+            path.setAttribute('fill-rule', 'evenodd');
+            path.setAttribute('stroke-width', '1.5');
+            path.setAttribute('stroke-dasharray', '6 3');
+            path.setAttribute('vector-effect', 'non-scaling-stroke');
+            g.insertBefore(path, g.firstChild);
+        }
+
+        const geom = (state.fill && state.fill.geom) || [];
+        const color = currentClassColor() || '#7c5cff';
+        path.setAttribute('fill', color);
+        path.setAttribute('fill-opacity', '0.35');
+        path.setAttribute('stroke', color);
+        path.setAttribute('d', geom.length ? multiPolygonToPathData(geom) : '');
+    }
+
+    function clearFillPreview() {
+        state.fill = null;
+        if (state.fillDebounce) { clearTimeout(state.fillDebounce); state.fillDebounce = 0; }
+        const svg = getSvg();
+        const path = svg && svg.querySelector('#sa-pb-fill-preview');
+        if (path) path.remove();
+        updateFillNote();
+    }
+
+    /**
+     * Right click: turn the preview into real polygons of the selected class.
+     * One addToHistory, so a single undo removes the whole fill.
+     */
+    function commitFillPreview() {
+        const svc = app.svc;
+        const fill = state.fill;
+        if (!svc || !fill || !fill.geom.length) return;
+
+        const classId = fill.classId;
+        const now = new Date().toISOString();
+        const author = svc.me ? { email: svc.me.id, roleId: svc.me.role && svc.me.role.id } : null;
+
+        const added = [];
+        const defaultAttrIds = new Set();
+        for (const poly of fill.geom) {
+            const json = polygonJson(poly, { classId, donor: null, keepId: false, now, author });
+            if (!json) continue;
+            defaultAttrIds.add(json.id);
+            added.push(json);
+        }
+
+        const count = added.length;
+        const wrote = applyObjectChanges({ removedIds: new Set(), added, defaultAttrIds });
+        clearFillPreview();
+        if (wrote) LOG(`fill committed: ${count} polygon(s)`);
     }
 
     // ---------------------------------------------------------------- boot

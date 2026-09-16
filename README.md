@@ -29,29 +29,51 @@ Then reload any open SuperAnnotate editor tab.
 
 ## What's included
 
-### Paintbrush & Eraser — `sa-paintbrush.user.js`
+### Paintbrush, Eraser & Fill by Color — `sa-paintbrush.user.js`
 
-Adds a brush tool group to the editor's left panel and a **Tool settings** tab
-to the right panel.
+Adds a tool group to the editor's left panel and a **Tool settings** tab to the
+right panel.
 
-- **Paintbrush** (`B`) — hold the left mouse button and drag to paint. On
-  release the stroke becomes a polygon in the currently selected class,
-  simplified with Ramer–Douglas–Peucker and merged with any overlapping
-  polygon of the same class.
-- **Eraser** (`E`) — the same stroke, subtracted instead. A polygon the stroke
-  cuts across is split into distinct polygons; one that is fully covered is
-  removed.
-- **Switching tools** — right-click or click-and-hold the brush button (or the
-  **Tool settings** tab) to open the tool menu, the same gesture the editor's
-  own tool groups use.
-- **Sizes** — brush and eraser sizes are in the **Tool settings** tab and are
-  remembered between sessions.
+- **Paintbrush** (<kbd>Shift</kbd>+<kbd>B</kbd>) — hold the left mouse button
+  and drag to paint. On release the stroke becomes a polygon in the currently
+  selected class, simplified with Ramer–Douglas–Peucker and merged with any
+  overlapping polygon of the same class.
+- **Eraser** (<kbd>Shift</kbd>+<kbd>E</kbd>) — the same stroke, subtracted
+  instead. A polygon the stroke cuts across is split into distinct polygons;
+  one that is fully covered is removed.
+- **Fill by Color** (<kbd>Shift</kbd>+<kbd>F</kbd>) — a port of GIMP's
+  *Select by Color*. **Left-click** the image to preview every region whose
+  colour is within the threshold of the pixel you clicked; **right-click** to
+  commit it as polygons. Nothing is created until that right-click. Adjusting
+  the settings updates the preview live, with no need to click again, and
+  left-clicking outside the image (or switching tools, or <kbd>Esc</kbd>)
+  discards it.
 
-Both tools only ever touch polygons of the currently selected class, and each
-stroke is a single undo step — the editor's undo button and <kbd>Ctrl</kbd>+<kbd>Z</kbd>
-revert a whole stroke.
+**Tool settings** holds brush and eraser sizes, and for Fill by Color the
+**Threshold** (0–255, GIMP's scale) and **Select by** criterion — Composite,
+Red, Green, Blue, HSV Hue, HSV Saturation and HSV Value. Settings are
+remembered between sessions.
+
+**Switching tools** — right-click or click-and-hold the tool button (or the
+**Tool settings** tab) to open the tool menu, the same gesture the editor's own
+tool groups use.
+
+Every tool only ever touches the currently selected class, and every action is
+a single undo step — the editor's undo button and <kbd>Ctrl</kbd>+<kbd>Z</kbd>
+revert a whole stroke or a whole fill.
+
+Shortcuts are <kbd>Shift</kbd>-based because every bare letter is already bound
+by the editor itself.
 
 Runs on `https://app.superannotate.com/editor/*`.
+
+#### Fill by Color requirements
+
+Reading image pixels means the browser has to fetch the image with CORS
+allowed. If your image host does not send `Access-Control-Allow-Origin`, the
+tool reports that it could not read the pixels instead of failing silently.
+Tiled (very large) projects render through OpenSeadragon rather than a plain
+image and are not supported yet.
 
 ## Updating
 
