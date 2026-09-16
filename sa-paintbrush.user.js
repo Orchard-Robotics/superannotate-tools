@@ -1,0 +1,1239 @@
+// ==UserScript==
+// @name         SuperAnnotate — Paintbrush tool
+// @namespace    superannotate-mods
+// @version      0.1.0
+// @description  Adds a left-panel tool group (Paintbrush + placeholder) and a right-panel settings tab. The paintbrush progressively unions brush stamps into a polygon of the current class, simplifies it with Ramer-Douglas-Peucker on release, merges it with overlapping same-class polygons, and commits one undo step.
+// @match        https://app.superannotate.com/editor/*
+// @run-at       document-idle
+// @grant        none
+// ==/UserScript==
+
+/*
+ * HOW THIS TALKS TO THE APP
+ * -------------------------
+ * The editor is an Angular 17 production build, so `window.ng` debug utilities
+ * are stripped (application_ref.ts:107 guards publishDefaultGlobalUtils with
+ * ngDevMode) and DOM `__ngContext__` values are numeric ids into a private
+ * registry (context_discovery.ts:182). Neither route reaches the services.
+ *
+ * What does work, and what this script uses:
+ *
+ *   1. The bundle is webpack 5 with the chunk global `webpackChunksa_editor_vector`.
+ *      Pushing a chunk with a runtime function hands us `__webpack_require__`.
+ *   2. Terser did not mangle property/method names, so modules can be located by
+ *      scanning factory sources for distinctive string literals.
+ *   3. `VectorEditorService` is found via its Clip Mode error message, and its
+ *      prototype is patched on `getStepsState` — a method the vector editor
+ *      template calls every change-detection cycle — which hands us both the
+ *      live service instance and Angular's NgZone (via `Zone.current`).
+ *
+ * The public surface used on the service (all names verified in the bundle):
+ *   objects, getObjectsJson(includeApproval), setObjects(json), addToHistory(),
+ *   getDrawClassesId(), getClassById(id), changeTool(toolType), zoomLevel, me
+ *
+ * Undo: the editor's history is snapshot based (shared-editor.service.ts:852).
+ * One addToHistory() call == one undo step, and undo() -> changeHistory() ->
+ * setObjects(previousSnapshot) rebuilds every object. So this script mutates
+ * nothing during a stroke and calls addToHistory() exactly once on commit.
+ */
+
+(function () {
+    'use strict';
+
+    // ---------------------------------------------------------------- config
+
+    const LS_KEY = 'sa-paintbrush-settings';
+
+    const DEFAULTS = {
+        brushSize: 30, // diameter, in image pixels
+    };
+
+    const BRUSH_MIN = 2;
+    const BRUSH_MAX = 400;
+
+    /** Minimum pointer travel (as a fraction of the brush radius) before a new
+     *  capsule is stamped. Keeps the progressive union from doing useless work. */
+    const RESAMPLE_FRACTION = 0.35;
+
+    /** RDP tolerance: scaled off the brush radius, floored so a deep zoom still
+     *  removes sub-pixel noise, and capped so big brushes stay recognisable. */
+    const SIMPLIFY = { radiusFactor: 0.06, min: 0.3, max: 4 };
+
+    const LOG = (...a) => console.log('%c[sa-paintbrush]', 'color:#7c5cff', ...a);
+    const WARN = (...a) => console.warn('[sa-paintbrush]', ...a);
+
+    // ----------------------------------------------------------- app bridge
+
+    const app = {
+        req: null,          // __webpack_require__
+        svc: null,          // live VectorEditorService instance
+        SvcClass: null,
+        zone: null,         // Angular NgZone's Zone, for change detection
+        pc: null,           // polygon-clipping { union, intersection, ... }
+    };
+
+    /**
+     * Grab `__webpack_require__` by pushing a no-op chunk. The jsonp callback
+     * invokes the third element (the runtime fn) with the require function.
+     */
+    function getWebpackRequire() {
+        const chunks = self.webpackChunksa_editor_vector;
+        if (!Array.isArray(chunks)) return null;
+        let req = null;
+        try {
+            chunks.push([['__sa_paintbrush_probe__'], {}, (r) => { req = r; }]);
+        } catch (e) {
+            WARN('chunk probe failed', e);
+        }
+        return req;
+    }
+
+    /** Find a module id whose factory source contains `marker`. */
+    function findModuleId(req, marker) {
+        const factories = req && req.m;
+        if (!factories) return null;
+        for (const id in factories) {
+            let src;
+            try {
+                src = Function.prototype.toString.call(factories[id]);
+            } catch (e) {
+                continue;
+            }
+            if (src.indexOf(marker) !== -1) return id;
+        }
+        return null;
+    }
+
+    /** polygon-clipping, borrowed from the app's own bundle (no CDN needed). */
+    function loadPolygonClipping(req) {
+        // Distinctive literal from polygon-clipping's ring builder.
+        const id = findModuleId(req, 'Unable to complete output ring');
+        if (id == null) return null;
+        let mod;
+        try {
+            mod = req(id);
+        } catch (e) {
+            WARN('polygon-clipping require failed', e);
+            return null;
+        }
+        const pc = mod && (mod.union ? mod : mod.default);
+        return pc && typeof pc.union === 'function' ? pc : null;
+    }
+
+    /**
+     * Find VectorEditorService and patch it so we get the live instance.
+     * `getStepsState` is defined on SharedEditorService and is called from the
+     * vector editor template, so it fires on every change-detection cycle.
+     */
+    function hookEditorService(req) {
+        const id = findModuleId(req, 'There was a problem with Clip Mode');
+        if (id == null) return false;
+
+        let mod;
+        try {
+            mod = req(id);
+        } catch (e) {
+            WARN('editor service require failed', e);
+            return false;
+        }
+
+        let Svc = null;
+        for (const key of Object.keys(mod || {})) {
+            let v;
+            try { v = mod[key]; } catch (e) { continue; }
+            const p = v && v.prototype;
+            if (typeof v === 'function' && p &&
+                typeof p.setObjects === 'function' &&
+                typeof p.addToHistory === 'function' &&
+                typeof p.getObjectsJson === 'function') {
+                Svc = v;
+                break;
+            }
+        }
+        if (!Svc) return false;
+        app.SvcClass = Svc;
+
+        // Walk to the prototype that actually owns getStepsState.
+        let proto = Svc.prototype;
+        while (proto && !Object.prototype.hasOwnProperty.call(proto, 'getStepsState')) {
+            proto = Object.getPrototypeOf(proto);
+        }
+        if (!proto) return false;
+        if (proto.__saPaintbrushHooked) return true;
+
+        const original = proto.getStepsState;
+        proto.getStepsState = function patchedGetStepsState() {
+            if (app.svc !== this) {
+                app.svc = this;
+                onServiceReady();
+            }
+            // Angular runs template expressions inside its own zone, so this is
+            // the NgZone we need to re-enter when committing a stroke.
+            if (!app.zone && typeof self.Zone !== 'undefined' && self.Zone.current) {
+                app.zone = self.Zone.current;
+            }
+            return original.apply(this, arguments);
+        };
+        proto.__saPaintbrushHooked = true;
+        return true;
+    }
+
+    /** Run `fn` inside Angular's zone so change detection picks up the result. */
+    function inNgZone(fn) {
+        if (app.zone && typeof app.zone.run === 'function') {
+            return app.zone.run(fn);
+        }
+        return fn();
+    }
+
+    // ------------------------------------------------------------- geometry
+
+    const round2 = (n) => Math.round(n * 100) / 100;
+
+    /** Perpendicular distance squared from p to segment a-b. */
+    function sqSegDist(p, a, b) {
+        let x = a[0], y = a[1];
+        let dx = b[0] - x, dy = b[1] - y;
+        if (dx !== 0 || dy !== 0) {
+            const t = ((p[0] - x) * dx + (p[1] - y) * dy) / (dx * dx + dy * dy);
+            if (t > 1) { x = b[0]; y = b[1]; }
+            else if (t > 0) { x += dx * t; y += dy * t; }
+        }
+        dx = p[0] - x;
+        dy = p[1] - y;
+        return dx * dx + dy * dy;
+    }
+
+    /** Ramer-Douglas-Peucker, iterative (no recursion depth limit). */
+    function rdp(points, epsilon) {
+        const n = points.length;
+        if (n < 3) return points.slice();
+        const sqEps = epsilon * epsilon;
+        const keep = new Uint8Array(n);
+        keep[0] = keep[n - 1] = 1;
+
+        const stack = [[0, n - 1]];
+        while (stack.length) {
+            const [first, last] = stack.pop();
+            let maxDist = 0;
+            let index = -1;
+            for (let i = first + 1; i < last; i++) {
+                const d = sqSegDist(points[i], points[first], points[last]);
+                if (d > maxDist) { maxDist = d; index = i; }
+            }
+            if (index !== -1 && maxDist > sqEps) {
+                keep[index] = 1;
+                stack.push([first, index], [index, last]);
+            }
+        }
+
+        const out = [];
+        for (let i = 0; i < n; i++) if (keep[i]) out.push(points[i]);
+        return out;
+    }
+
+    /** Ensure a ring repeats its first vertex at the end. */
+    function closeRing(ring) {
+        if (ring.length < 2) return ring.slice();
+        const a = ring[0], b = ring[ring.length - 1];
+        return (a[0] === b[0] && a[1] === b[1]) ? ring.slice() : ring.concat([[a[0], a[1]]]);
+    }
+
+    /** Shoelace area of a closed ring, unsigned. */
+    function ringArea(ring) {
+        let total = 0;
+        for (let i = 0; i < ring.length - 1; i++) {
+            total += ring[i][0] * ring[i + 1][1] - ring[i + 1][0] * ring[i][1];
+        }
+        return Math.abs(total / 2);
+    }
+
+    /**
+     * Simplify a closed ring. Returns null when the ring collapses below a
+     * triangle, so the caller can decide: an outer ring falls back to the
+     * original, a hole is dropped.
+     */
+    function simplifyRing(inputRing, epsilon) {
+        const ring = closeRing(inputRing);
+        const open = ring.slice(0, ring.length - 1);
+        if (open.length < 3) return null;
+        if (open.length === 3) return ring.slice();
+        const simplified = rdp(open, epsilon);
+        if (simplified.length < 3) return null;
+        return simplified.concat([[simplified[0][0], simplified[0][1]]]);
+    }
+
+    function simplifyMultiPolygon(mp, epsilon) {
+        // Anything smaller than the simplification tolerance is brush noise.
+        // Mirrors the editor's own clip mode, which drops sub-unit slivers.
+        const minArea = Math.max(1, epsilon * epsilon * 4);
+        const out = [];
+
+        for (const poly of mp) {
+            if (!poly.length) continue;
+
+            // Outer ring: prefer the simplified form, fall back to the original
+            // rather than throwing the polygon away.
+            let outer = simplifyRing(poly[0], epsilon) || closeRing(poly[0]);
+            if (outer.length - 1 < 3) continue;
+            if (ringArea(outer) < minArea) continue;
+
+            const rings = [outer];
+            for (let i = 1; i < poly.length; i++) {
+                const hole = simplifyRing(poly[i], epsilon);
+                if (!hole) continue;                       // collapsed -> drop
+                if (ringArea(hole) < minArea) continue;    // sub-tolerance -> drop
+                rings.push(hole);
+            }
+            out.push(rings);
+        }
+        return out;
+    }
+
+    /** Circle approximated as an N-gon, N scaled to the radius. */
+    function circleSegments(radius) {
+        return Math.max(12, Math.min(48, Math.round(radius * 1.6) + 10));
+    }
+
+    /** A capsule (stadium) ring covering the swept disc from a to b. */
+    function capsuleRing(ax, ay, bx, by, r) {
+        const segs = circleSegments(r);
+        const dx = bx - ax, dy = by - ay;
+        const ring = [];
+
+        if (Math.abs(dx) < 1e-9 && Math.abs(dy) < 1e-9) {
+            for (let i = 0; i < segs; i++) {
+                const t = (i / segs) * Math.PI * 2;
+                ring.push([ax + Math.cos(t) * r, ay + Math.sin(t) * r]);
+            }
+            ring.push(ring[0].slice());
+            return ring;
+        }
+
+        const ang = Math.atan2(dy, dx);
+        // Must be even, otherwise the sweep steps straight over the cap's apex
+        // and the stroke ends up narrower than the nominal brush size.
+        const half = Math.max(4, Math.round(segs / 2) + (Math.round(segs / 2) % 2));
+
+        // Cap around b, sweeping from ang-PI/2 to ang+PI/2.
+        for (let i = 0; i <= half; i++) {
+            const t = ang - Math.PI / 2 + (i / half) * Math.PI;
+            ring.push([bx + Math.cos(t) * r, by + Math.sin(t) * r]);
+        }
+        // Cap around a, sweeping the other side.
+        for (let i = 0; i <= half; i++) {
+            const t = ang + Math.PI / 2 + (i / half) * Math.PI;
+            ring.push([ax + Math.cos(t) * r, ay + Math.sin(t) * r]);
+        }
+        ring.push(ring[0].slice());
+        return ring;
+    }
+
+    function ringBBox(ring, box) {
+        for (const [x, y] of ring) {
+            if (x < box.minX) box.minX = x;
+            if (x > box.maxX) box.maxX = x;
+            if (y < box.minY) box.minY = y;
+            if (y > box.maxY) box.maxY = y;
+        }
+        return box;
+    }
+
+    function multiPolygonBBox(mp) {
+        const box = { minX: Infinity, minY: Infinity, maxX: -Infinity, maxY: -Infinity };
+        for (const poly of mp) ringBBox(poly[0], box);
+        return box;
+    }
+
+    function boxesOverlap(a, b, pad) {
+        pad = pad || 0;
+        return !(a.minX > b.maxX + pad || a.maxX < b.minX - pad ||
+                 a.minY > b.maxY + pad || a.maxY < b.minY - pad);
+    }
+
+    /** Editor flat [x,y,x,y,...] -> closed ring [[x,y],...]. */
+    function pointsToRing(points) {
+        const ring = [];
+        for (let i = 0; i + 1 < points.length; i += 2) ring.push([points[i], points[i + 1]]);
+        if (!ring.length) return ring;
+        const first = ring[0], last = ring[ring.length - 1];
+        if (first[0] !== last[0] || first[1] !== last[1]) ring.push([first[0], first[1]]);
+        return ring;
+    }
+
+    /** Closed ring -> editor flat [x,y,...] with the closing vertex dropped. */
+    function ringToPoints(inputRing) {
+        const ring = closeRing(inputRing);
+        const out = [];
+        for (let i = 0; i < ring.length - 1; i++) {
+            out.push(round2(ring[i][0]), round2(ring[i][1]));
+        }
+        return out;
+    }
+
+    /** EditorPolygon -> polygon-clipping Polygon: [outer, ...holes]. */
+    function editorPolygonToGeom(obj) {
+        const rings = [pointsToRing(obj.points)];
+        if (obj.exclude && obj.exclude.length) {
+            for (const hole of obj.exclude) {
+                const r = pointsToRing(hole.points || hole);
+                if (r.length >= 4) rings.push(r);
+            }
+        }
+        return rings;
+    }
+
+    function uuidv4() {
+        if (self.crypto && self.crypto.randomUUID) return self.crypto.randomUUID();
+        return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+            const r = (Math.random() * 16) | 0;
+            return (c === 'x' ? r : (r & 0x3) | 0x8).toString(16);
+        });
+    }
+
+    // -------------------------------------------------------------- settings
+
+    const settings = Object.assign({}, DEFAULTS, readSettings());
+
+    function readSettings() {
+        try {
+            return JSON.parse(localStorage.getItem(LS_KEY) || '{}');
+        } catch (e) {
+            return {};
+        }
+    }
+
+    function saveSettings() {
+        try {
+            localStorage.setItem(LS_KEY, JSON.stringify(settings));
+        } catch (e) { /* private mode */ }
+    }
+
+    // ------------------------------------------------------------ tool model
+
+    const TOOLS = [
+        {
+            id: 'paintbrush',
+            name: 'Paintbrush',
+            shortcut: 'B',
+            icon: '<path d="M7.5 14.5c-1.6 0-2.9 1.3-2.9 2.9 0 1.3-1.1 1.7-1.6 1.8 1 1.1 2.4 1.8 4 1.8 2.2 0 4-1.8 4-4 0-1.4-1.1-2.5-2.5-2.5z"/>'
+                + '<path d="M20.7 4.3a2 2 0 0 0-2.8 0l-7.5 8.1c-.3.3-.3.4-.1.6l1.6 1.6c.2.2.3.2.6-.1l8.1-7.5a2 2 0 0 0 .1-2.7z"/>',
+            settings: ['brushSize'],
+        },
+        {
+            id: 'placeholder',
+            name: 'Placeholder',
+            shortcut: null,
+            icon: '<path d="M12 3.5 4 8v8l8 4.5 8-4.5V8l-8-4.5zm0 2.3 5.9 3.3L12 12.4 6.1 9.1 12 5.8zM6 10.8l5 2.8v5.6l-5-2.8v-5.6zm7 8.4v-5.6l5-2.8v5.6l-5 2.8z"/>',
+            settings: [],
+        },
+    ];
+
+    const SETTING_DEFS = {
+        brushSize: {
+            label: 'Brush size',
+            unit: 'px',
+            min: BRUSH_MIN,
+            max: BRUSH_MAX,
+            step: 1,
+            get: () => settings.brushSize,
+            set: (v) => {
+                settings.brushSize = Math.max(BRUSH_MIN, Math.min(BRUSH_MAX, Math.round(v)));
+                saveSettings();
+            },
+        },
+    };
+
+    const state = {
+        activeToolId: null,
+        stroke: null,
+        ui: {},
+    };
+
+    // --------------------------------------------------------------- styles
+
+    function injectStyles() {
+        if (document.getElementById('sa-paintbrush-styles')) return;
+        const css = `
+        .sa-pb-item { position: relative; }
+        .sa-pb-btn {
+            width: 32px; height: 32px; display: flex; align-items: center; justify-content: center;
+            border: none; border-radius: 4px; background: transparent; cursor: pointer;
+            color: currentColor; padding: 0;
+        }
+        .sa-pb-btn:hover { background: rgba(127,127,127,.18); }
+        .sa-pb-btn.selected { background: rgba(124,92,255,.18); color: #7c5cff; }
+        .sa-pb-btn svg { width: 22px; height: 22px; fill: currentColor; pointer-events: none; }
+        .sa-pb-btn.has-menu::after {
+            content: ''; position: absolute; right: 4px; bottom: 4px;
+            border: 3px solid transparent; border-right-color: currentColor; border-bottom-color: currentColor;
+            opacity: .55;
+        }
+        .sa-pb-menu {
+            position: fixed; z-index: 100000; width: 242px; padding: 8px; border-radius: 8px;
+            background: var(--sn-color-bg-elevated, #23252b); color: var(--sn-color-text, #e8e8ea);
+            box-shadow: 0 8px 24px rgba(0,0,0,.35); font-size: 13px;
+        }
+        .sa-pb-menu-item {
+            display: flex; align-items: center; justify-content: space-between;
+            padding: 6px 8px; border-radius: 4px; cursor: pointer;
+        }
+        .sa-pb-menu-item:hover { background: rgba(127,127,127,.18); }
+        .sa-pb-menu-item.selected { background: rgba(124,92,255,.18); }
+        .sa-pb-menu-item .sa-pb-menu-info { display: flex; align-items: center; gap: 8px; }
+        .sa-pb-menu-item svg { width: 24px; height: 24px; fill: currentColor; }
+        .sa-pb-menu-item kbd {
+            font: inherit; font-size: 11px; padding: 1px 6px; border-radius: 3px;
+            background: rgba(127,127,127,.22); opacity: .8;
+        }
+        .sa-pb-settings {
+            flex: 1; min-height: 0; overflow-y: auto; padding: 16px;
+            font-size: 13px; color: var(--sn-color-text, inherit);
+        }
+        .sa-pb-settings h4 { margin: 0 0 14px; font-size: 13px; font-weight: 600; opacity: .85; }
+        .sa-pb-field { margin-bottom: 18px; }
+        .sa-pb-field-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+        .sa-pb-field-head label { opacity: .8; }
+        .sa-pb-field-row { display: flex; align-items: center; gap: 10px; }
+        .sa-pb-field-row input[type=range] { flex: 1; accent-color: #7c5cff; }
+        .sa-pb-field-row input[type=number] {
+            width: 68px; padding: 4px 6px; border-radius: 4px;
+            border: 1px solid rgba(127,127,127,.4); background: transparent; color: inherit;
+        }
+        .sa-pb-empty { opacity: .6; font-style: italic; }
+        .sa-pb-hidden-body { display: none !important; }
+        `;
+        const el = document.createElement('style');
+        el.id = 'sa-paintbrush-styles';
+        el.textContent = css;
+        document.head.appendChild(el);
+    }
+
+    function svgIcon(paths, size) {
+        return `<svg viewBox="0 0 24 24" width="${size || 22}" height="${size || 22}" aria-hidden="true">${paths}</svg>`;
+    }
+
+    // ------------------------------------------------------------ left panel
+
+    function ensureLeftPanelItem() {
+        const section = document.querySelector('.left-panel-container .top-section');
+        if (!section) return;
+        if (section.querySelector('.sa-pb-item')) return;
+
+        const tool = TOOLS[0];
+
+        const wrap = document.createElement('div');
+        // Borrow the app's own container class so padding/border match, and carry
+        // the Angular emulated-encapsulation attribute from a sibling so the
+        // component-scoped CSS applies to us too.
+        wrap.className = 'left-panel-item-container sa-pb-item';
+        const sibling = section.querySelector('left-panel-item .left-panel-item-container');
+        if (sibling) {
+            for (const attr of sibling.attributes) {
+                if (attr.name.startsWith('_ngcontent')) wrap.setAttribute(attr.name, '');
+            }
+        }
+
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'sa-pb-btn has-menu';
+        btn.title = 'Paintbrush  (right-click for more tools)';
+        btn.setAttribute('data-qa-id', 'sa-paintbrush-tool');
+        btn.innerHTML = svgIcon(tool.icon);
+
+        btn.addEventListener('click', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            activateTool(state.lastPickedId || 'paintbrush');
+        });
+        btn.addEventListener('contextmenu', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            openNestedMenu(btn);
+        });
+
+        wrap.appendChild(btn);
+        section.appendChild(wrap);
+        state.ui.leftButton = btn;
+        syncLeftPanel();
+    }
+
+    function openNestedMenu(anchor) {
+        closeNestedMenu();
+        const rect = anchor.getBoundingClientRect();
+
+        const menu = document.createElement('div');
+        menu.className = 'sa-pb-menu';
+        menu.setAttribute('data-qa-id', 'sa-paintbrush-nested-tools-menu');
+
+        for (const tool of TOOLS) {
+            const item = document.createElement('div');
+            item.className = 'sa-pb-menu-item' + (state.activeToolId === tool.id ? ' selected' : '');
+            item.setAttribute('data-qa-id', tool.id);
+            item.innerHTML =
+                `<div class="sa-pb-menu-info">${svgIcon(tool.icon, 24)}<span>${tool.name}</span></div>` +
+                (tool.shortcut ? `<kbd>${tool.shortcut}</kbd>` : '');
+            item.addEventListener('mouseup', (e) => {
+                e.stopPropagation();
+                closeNestedMenu();
+                activateTool(tool.id);
+            });
+            menu.appendChild(item);
+        }
+
+        document.body.appendChild(menu);
+        menu.style.left = Math.round(rect.right + 8) + 'px';
+        menu.style.top = Math.round(Math.min(rect.top, window.innerHeight - menu.offsetHeight - 8)) + 'px';
+
+        state.ui.menu = menu;
+        setTimeout(() => {
+            document.addEventListener('mousedown', closeNestedMenuOnOutside, true);
+        }, 0);
+    }
+
+    function closeNestedMenuOnOutside(e) {
+        if (state.ui.menu && !state.ui.menu.contains(e.target)) closeNestedMenu();
+    }
+
+    function closeNestedMenu() {
+        if (state.ui.menu) {
+            state.ui.menu.remove();
+            state.ui.menu = null;
+        }
+        document.removeEventListener('mousedown', closeNestedMenuOnOutside, true);
+    }
+
+    function syncLeftPanel() {
+        const btn = state.ui.leftButton;
+        if (!btn) return;
+        const active = TOOLS.find((t) => t.id === state.activeToolId);
+        btn.classList.toggle('selected', !!active);
+        if (active) btn.innerHTML = svgIcon(active.icon);
+    }
+
+    // ----------------------------------------------------------- right panel
+
+    function ensureRightPanelTab() {
+        const labels = document.querySelector('.right-panel-wrapper .sn-tab-labels');
+        const body = document.querySelector('.right-panel-wrapper .sn-tab-body');
+        if (!labels || !body) return;
+        if (labels.querySelector('.sa-pb-tab')) return;
+
+        // Clone a native label so every Angular-scoped class/attribute is kept.
+        const native = labels.querySelector('.sn-tab-label');
+        let tab;
+        if (native) {
+            tab = native.cloneNode(true);
+            tab.classList.remove('sn-tab-label-active');
+            tab.removeAttribute('id');
+            tab.removeAttribute('aria-posinset');
+            tab.removeAttribute('aria-setsize');
+            const text = tab.querySelector('.sn-tab-label-text');
+            if (text) text.textContent = 'Tool settings';
+            else tab.textContent = 'Tool settings';
+            const icon = tab.querySelector('sn-icon');
+            if (icon) icon.remove();
+        } else {
+            tab = document.createElement('div');
+            tab.className = 'sn-tab-label';
+            tab.setAttribute('role', 'tab');
+            tab.textContent = 'Tool settings';
+        }
+        tab.classList.add('sa-pb-tab');
+        tab.setAttribute('data-qa-id', 'sa-paintbrush-settings-tab-header');
+        tab.addEventListener('click', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            openSettingsTab();
+        }, true);
+        labels.appendChild(tab);
+
+        const panel = document.createElement('div');
+        panel.className = 'sa-pb-settings';
+        panel.setAttribute('data-qa-id', 'sa-paintbrush-settings');
+        panel.style.display = 'none';
+        body.parentNode.insertBefore(panel, body.nextSibling);
+
+        // Any click on a native tab hands control back to the app.
+        labels.addEventListener('click', (e) => {
+            const label = e.target.closest && e.target.closest('.sn-tab-label');
+            if (label && !label.classList.contains('sa-pb-tab')) closeSettingsTab();
+        }, true);
+
+        state.ui.tab = tab;
+        state.ui.settingsPanel = panel;
+        state.ui.tabBody = body;
+        renderSettings();
+    }
+
+    function openSettingsTab() {
+        const { tab, settingsPanel, tabBody } = state.ui;
+        if (!tab || !settingsPanel || !tabBody) return;
+        for (const other of tab.parentNode.querySelectorAll('.sn-tab-label')) {
+            other.classList.toggle('sn-tab-label-active', other === tab);
+        }
+        tabBody.classList.add('sa-pb-hidden-body');
+        settingsPanel.style.display = 'flex';
+        settingsPanel.style.flexDirection = 'column';
+        renderSettings();
+    }
+
+    function closeSettingsTab() {
+        const { tab, settingsPanel, tabBody } = state.ui;
+        if (!tab || !settingsPanel || !tabBody) return;
+        tab.classList.remove('sn-tab-label-active');
+        tabBody.classList.remove('sa-pb-hidden-body');
+        settingsPanel.style.display = 'none';
+    }
+
+    function isSettingsTabOpen() {
+        return !!(state.ui.tab && state.ui.tab.classList.contains('sn-tab-label-active'));
+    }
+
+    function renderSettings() {
+        const panel = state.ui.settingsPanel;
+        if (!panel) return;
+
+        const tool = TOOLS.find((t) => t.id === state.activeToolId) || TOOLS[0];
+        panel.innerHTML = '';
+
+        const title = document.createElement('h4');
+        title.textContent = tool.name;
+        panel.appendChild(title);
+
+        if (!tool.settings.length) {
+            const empty = document.createElement('div');
+            empty.className = 'sa-pb-empty';
+            empty.textContent = 'This tool has no settings yet.';
+            panel.appendChild(empty);
+            return;
+        }
+
+        for (const key of tool.settings) {
+            const def = SETTING_DEFS[key];
+            if (!def) continue;
+
+            const field = document.createElement('div');
+            field.className = 'sa-pb-field';
+
+            const head = document.createElement('div');
+            head.className = 'sa-pb-field-head';
+            head.innerHTML = `<label for="sa-pb-${key}">${def.label}</label><span class="sa-pb-unit">${def.unit || ''}</span>`;
+            field.appendChild(head);
+
+            const row = document.createElement('div');
+            row.className = 'sa-pb-field-row';
+
+            const range = document.createElement('input');
+            range.type = 'range';
+            range.id = `sa-pb-${key}`;
+            range.min = def.min; range.max = def.max; range.step = def.step;
+            range.value = def.get();
+
+            const number = document.createElement('input');
+            number.type = 'number';
+            number.min = def.min; number.max = def.max; number.step = def.step;
+            number.value = def.get();
+
+            const push = (v) => {
+                def.set(Number(v));
+                range.value = def.get();
+                number.value = def.get();
+                updateCursor();
+            };
+            range.addEventListener('input', () => push(range.value));
+            number.addEventListener('change', () => push(number.value));
+
+            row.appendChild(range);
+            row.appendChild(number);
+            field.appendChild(row);
+            panel.appendChild(field);
+        }
+    }
+
+    // -------------------------------------------------------- tool lifecycle
+
+    function activateTool(toolId) {
+        if (state.activeToolId === toolId) {
+            deactivateTool();
+            return;
+        }
+        state.activeToolId = toolId;
+        state.lastPickedId = toolId;
+
+        // Disarm whatever editor tool was active so it cannot also react.
+        if (app.svc && typeof app.svc.changeTool === 'function') {
+            inNgZone(() => {
+                try {
+                    app.svc.drawingObject = null;
+                    app.svc.changeTool('select');
+                } catch (e) { /* noop */ }
+            });
+        }
+
+        syncLeftPanel();
+        renderSettings();
+        openSettingsTab();
+        updateCursor();
+        LOG('activated', toolId);
+    }
+
+    function deactivateTool() {
+        state.activeToolId = null;
+        abortStroke();
+        syncLeftPanel();
+        renderSettings();
+        updateCursor();
+    }
+
+    /** Clicking any native left-panel tool releases our tool. */
+    function watchNativeToolClicks() {
+        document.addEventListener('click', (e) => {
+            if (!state.activeToolId) return;
+            const t = e.target;
+            if (!t || !t.closest) return;
+            if (t.closest('.sa-pb-item') || t.closest('.sa-pb-menu')) return;
+            if (t.closest('left-panel-item') || t.closest('.left-panel-container .bottom-section')) {
+                deactivateTool();
+            }
+        }, true);
+
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape' && state.activeToolId) {
+                deactivateTool();
+            } else if ((e.key === 'b' || e.key === 'B') && !e.ctrlKey && !e.metaKey && !e.altKey) {
+                const tag = (e.target && e.target.tagName) || '';
+                if (tag === 'INPUT' || tag === 'TEXTAREA' || (e.target && e.target.isContentEditable)) return;
+                e.preventDefault();
+                activateTool('paintbrush');
+            }
+        }, true);
+    }
+
+    // ------------------------------------------------------------ svg canvas
+
+    function getSvg() {
+        return document.getElementById('editor-svg');
+    }
+
+    /** Client coords -> image coords, via the SVG's own screen CTM. */
+    function toImagePoint(svg, clientX, clientY) {
+        const pt = svg.createSVGPoint();
+        pt.x = clientX;
+        pt.y = clientY;
+        const ctm = svg.getScreenCTM();
+        if (!ctm) return null;
+        const p = pt.matrixTransform(ctm.inverse());
+        return [p.x, p.y];
+    }
+
+    function ensureOverlay(svg) {
+        let g = svg.querySelector('#sa-pb-overlay');
+        if (!g) {
+            g = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+            g.setAttribute('id', 'sa-pb-overlay');
+            g.setAttribute('pointer-events', 'none');
+            svg.appendChild(g);
+        } else if (g !== svg.lastChild) {
+            svg.appendChild(g); // keep on top after Angular re-renders
+        }
+        return g;
+    }
+
+    function updateCursor() {
+        const svg = getSvg();
+        if (!svg) return;
+        // NOTE: the svg's class attribute is Angular-bound ([attr.class]="svgClass + ...")
+        // and is rewritten on every tool change, so the cursor goes on inline style,
+        // which nothing in the app touches.
+        svg.style.cursor = state.activeToolId === 'paintbrush' ? 'none' : '';
+        if (state.activeToolId !== 'paintbrush') {
+            const c = svg.querySelector('#sa-pb-cursor');
+            if (c) c.remove();
+        }
+    }
+
+    function drawCursor(svg, x, y) {
+        const g = ensureOverlay(svg);
+        let c = svg.querySelector('#sa-pb-cursor');
+        if (!c) {
+            c = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+            c.setAttribute('id', 'sa-pb-cursor');
+            c.setAttribute('fill', 'none');
+            c.setAttribute('stroke-width', '1');
+            c.setAttribute('vector-effect', 'non-scaling-stroke');
+            g.appendChild(c);
+        }
+        c.setAttribute('cx', x);
+        c.setAttribute('cy', y);
+        c.setAttribute('r', settings.brushSize / 2);
+        c.setAttribute('stroke', currentClassColor() || '#7c5cff');
+    }
+
+    function multiPolygonToPathData(mp) {
+        let d = '';
+        for (const poly of mp) {
+            for (const ring of poly) {
+                if (!ring.length) continue;
+                d += 'M' + ring.map((p) => `${p[0].toFixed(2)},${p[1].toFixed(2)}`).join('L') + 'Z';
+            }
+        }
+        return d;
+    }
+
+    function renderStrokePreview(svg, mp) {
+        const g = ensureOverlay(svg);
+        let path = svg.querySelector('#sa-pb-preview');
+        if (!path) {
+            path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+            path.setAttribute('id', 'sa-pb-preview');
+            path.setAttribute('fill-rule', 'evenodd');
+            path.setAttribute('stroke-width', '1.5');
+            path.setAttribute('vector-effect', 'non-scaling-stroke');
+            g.insertBefore(path, g.firstChild);
+        }
+        const color = currentClassColor() || '#7c5cff';
+        path.setAttribute('fill', color);
+        path.setAttribute('fill-opacity', '0.45');
+        path.setAttribute('stroke', color);
+        path.setAttribute('d', mp && mp.length ? multiPolygonToPathData(mp) : '');
+    }
+
+    function clearStrokePreview() {
+        const svg = getSvg();
+        if (!svg) return;
+        const path = svg.querySelector('#sa-pb-preview');
+        if (path) path.remove();
+    }
+
+    function currentClassColor() {
+        try {
+            const cls = app.svc.getClassById(app.svc.getDrawClassesId());
+            return cls && cls.color;
+        } catch (e) {
+            return null;
+        }
+    }
+
+    // ------------------------------------------------------------- the brush
+
+    function installCanvasHandlers() {
+        // Capture phase on window: the editor component binds its own handlers
+        // to `.editor-workspace`, a descendant, so ours runs first and can stop
+        // the event from ever reaching the app's active tool.
+        window.addEventListener('mousedown', onMouseDown, true);
+        window.addEventListener('mousemove', onMouseMove, true);
+        window.addEventListener('mouseup', onMouseUp, true);
+
+        // NOT window+capture: mouseleave does not bubble, but it still runs the
+        // capture phase on ancestors, so a window capture listener fires for
+        // mouseleave on every element in the page - including each existing
+        // polygon the brush crosses, which would end the stroke mid-drag.
+        // On `document` in the bubble phase it fires only when the pointer
+        // genuinely leaves the page.
+        document.addEventListener('mouseleave', onPointerLeftPage);
+    }
+
+    function overCanvas(e) {
+        const t = e.target;
+        return !!(t && t.closest && t.closest('.editor-workspace'));
+    }
+
+    function onMouseDown(e) {
+        if (state.activeToolId !== 'paintbrush') return;
+        if (e.button !== 0) return;       // leave middle-drag pan / right-click menu alone
+        if (!overCanvas(e)) return;
+        const svg = getSvg();
+        if (!svg || !app.svc || !app.pc) return;
+
+        e.preventDefault();
+        e.stopPropagation();
+
+        const p = toImagePoint(svg, e.clientX, e.clientY);
+        if (!p) return;
+
+        const radius = settings.brushSize / 2;
+        state.stroke = {
+            radius,
+            classId: app.svc.getDrawClassesId(),
+            last: p,
+            pending: [],
+            geom: null,
+            rafId: 0,
+        };
+
+        // Seed with a single dot so a click (no drag) still paints.
+        state.stroke.pending.push([p[0], p[1], p[0], p[1]]);
+        scheduleStrokeFlush(svg);
+    }
+
+    function onMouseMove(e) {
+        if (state.activeToolId !== 'paintbrush') return;
+        const svg = getSvg();
+        if (!svg) return;
+
+        if (overCanvas(e)) {
+            const p = toImagePoint(svg, e.clientX, e.clientY);
+            if (p) drawCursor(svg, p[0], p[1]);
+        }
+
+        const stroke = state.stroke;
+        if (!stroke) return;
+
+        // Safety net: if the primary button is no longer down we missed the
+        // mouseup (released over browser chrome, or an alert stole focus).
+        // Finish the stroke rather than painting a trail with the button up.
+        if ((e.buttons & 1) === 0) {
+            endStroke(null);
+            return;
+        }
+
+        e.preventDefault();
+        e.stopPropagation();
+
+        const p = toImagePoint(svg, e.clientX, e.clientY);
+        if (!p) return;
+
+        const dx = p[0] - stroke.last[0];
+        const dy = p[1] - stroke.last[1];
+        const minStep = stroke.radius * RESAMPLE_FRACTION;
+        if (dx * dx + dy * dy < minStep * minStep) return;
+
+        stroke.pending.push([stroke.last[0], stroke.last[1], p[0], p[1]]);
+        stroke.last = p;
+        scheduleStrokeFlush(svg);
+    }
+
+    /**
+     * Progressive union: every animation frame, fold the capsules stamped since
+     * the last frame into the accumulated stroke geometry.
+     */
+    function scheduleStrokeFlush(svg) {
+        const stroke = state.stroke;
+        if (!stroke || stroke.rafId) return;
+        stroke.rafId = requestAnimationFrame(() => {
+            stroke.rafId = 0;
+            flushStroke(svg);
+        });
+    }
+
+    function flushStroke(svg) {
+        const stroke = state.stroke;
+        if (!stroke || !stroke.pending.length) return;
+
+        const stamps = stroke.pending.map(([ax, ay, bx, by]) => [capsuleRing(ax, ay, bx, by, stroke.radius)]);
+        stroke.pending.length = 0;
+
+        try {
+            stroke.geom = stroke.geom
+                ? app.pc.union(stroke.geom, ...stamps)
+                : app.pc.union(stamps[0], ...stamps.slice(1));
+        } catch (err) {
+            WARN('union failed for this frame, skipping', err);
+            return;
+        }
+        renderStrokePreview(svg, stroke.geom);
+    }
+
+    /** The pointer left the page entirely - finish the stroke where it stands. */
+    function onPointerLeftPage() {
+        if (state.stroke) endStroke(null);
+    }
+
+    function onMouseUp(e) {
+        if (!state.stroke) return;
+        if (e.button !== 0) return;
+        endStroke(e);
+    }
+
+    function endStroke(e) {
+        if (!state.stroke) return;
+
+        const svg = getSvg();
+        const stroke = state.stroke;
+        state.stroke = null;
+
+        if (stroke.rafId) cancelAnimationFrame(stroke.rafId);
+        if (svg && stroke.pending.length) {
+            state.stroke = stroke;
+            flushStroke(svg);
+            state.stroke = null;
+        }
+
+        clearStrokePreview();
+
+        if (e) {
+            e.preventDefault();
+            e.stopPropagation();
+        }
+
+        if (!stroke.geom || !stroke.geom.length) return;
+        commitStroke(stroke);
+    }
+
+    function abortStroke() {
+        if (state.stroke && state.stroke.rafId) cancelAnimationFrame(state.stroke.rafId);
+        state.stroke = null;
+        clearStrokePreview();
+    }
+
+    // ------------------------------------------------------------- commit
+
+    function commitStroke(stroke) {
+        const svc = app.svc;
+        const pc = app.pc;
+        if (!svc || !pc) return;
+
+        // 1. Simplify with RDP. Tolerance scales with the brush so a fat stroke
+        //    does not carry hundreds of near-collinear vertices.
+        const zoom = svc.zoomLevel || 1;
+        const epsilon = Math.max(
+            SIMPLIFY.min,
+            Math.min(SIMPLIFY.max, Math.max(stroke.radius * SIMPLIFY.radiusFactor, 0.8 / Math.sqrt(zoom)))
+        );
+
+        let geom = simplifyMultiPolygon(stroke.geom, epsilon);
+        if (!geom.length) return;
+
+        // 2. Union with every overlapping, visible polygon of the same class.
+        const strokeBox = multiPolygonBBox(geom);
+        const classId = stroke.classId;
+
+        const candidates = (svc.objects || []).filter((o) =>
+            o && o.type === 'polygon' && !o.isHole && o.classId === classId &&
+            o.visible !== false && Array.isArray(o.points) && o.points.length >= 6
+        );
+
+        const merged = [];
+        for (const obj of candidates) {
+            let objGeom;
+            try {
+                objGeom = editorPolygonToGeom(obj);
+            } catch (err) { continue; }
+            if (!boxesOverlap(strokeBox, multiPolygonBBox([objGeom]), 1)) continue;
+            try {
+                // bbox overlap is only a broad phase; require real intersection
+                // so a disjoint neighbour is never rewritten.
+                const hit = pc.intersection(geom, objGeom);
+                if (!hit || !hit.length) continue;
+                geom = pc.union(geom, objGeom);
+                merged.push(obj);
+            } catch (err) {
+                WARN('merge skipped for object', obj.id, err);
+            }
+        }
+
+        if (!geom.length) return;
+
+        // 3. Rebuild the annotation as plain JSON, swap the merged polygons for
+        //    the result, hand it back through setObjects, and record ONE history
+        //    snapshot. Undo then replays setObjects(previousSnapshot).
+        inNgZone(() => {
+            const json = svc.getObjectsJson(true);
+            const removed = new Set(merged.map((o) => o.id));
+            const next = json.filter((o) => !removed.has(o.id));
+
+            const donor = merged[0] || null;
+            const now = new Date().toISOString();
+            const author = svc.me ? { email: svc.me.id, roleId: svc.me.role && svc.me.role.id } : null;
+            const newIds = [];
+
+            geom.forEach((poly, i) => {
+                const points = ringToPoints(poly[0]);
+                if (points.length < 6) return;
+
+                const exclude = [];
+                for (let h = 1; h < poly.length; h++) {
+                    const hole = ringToPoints(poly[h]);
+                    if (hole.length >= 6) exclude.push(hole);
+                }
+
+                // Reuse the first merged polygon's identity so selection,
+                // grouping and attributes survive the merge (same trick the
+                // editor's own clip mode uses in cutter.ts).
+                const reuse = i === 0 && donor;
+                const id = reuse ? donor.id : uuidv4();
+                if (!reuse) newIds.push(id);
+
+                next.push({
+                    id,
+                    type: 'polygon',
+                    classId,
+                    probability: 100,
+                    points,
+                    exclude,
+                    groupId: reuse ? donor.groupId || 0 : 0,
+                    pointLabels: {},
+                    locked: reuse ? !!donor.locked : false,
+                    attributes: reuse && donor.attributes ? donor.attributes.map((a) => ({ ...a })) : [],
+                    error: reuse ? donor.error : null,
+                    createdAt: reuse && donor.createdAt ? donor.createdAt : now,
+                    createdBy: reuse && donor.createdBy ? donor.createdBy : author,
+                    creationType: 'Manual',
+                    updatedAt: now,
+                    updatedBy: author,
+                });
+            });
+
+            svc.setObjects(next);
+
+            // Brand-new polygons get the class's default attributes, exactly as
+            // the editor does for its own freshly drawn shapes.
+            if (newIds.length) {
+                const wanted = new Set(newIds);
+                for (const o of svc.objects) {
+                    if (wanted.has(o.id) && typeof o.setDefaultAttributes === 'function') {
+                        try { o.setDefaultAttributes(); } catch (err) { /* noop */ }
+                    }
+                }
+            }
+
+            svc.addToHistory();
+        });
+
+        LOG(`committed: ${geom.length} polygon(s), merged ${merged.length}, eps=${epsilon.toFixed(2)}`);
+    }
+
+    // ---------------------------------------------------------------- boot
+
+    let serviceReadyFired = false;
+
+    function onServiceReady() {
+        if (serviceReadyFired) return;
+        serviceReadyFired = true;
+        LOG('editor service captured');
+    }
+
+    function tryBridge() {
+        if (!app.req) app.req = getWebpackRequire();
+        if (!app.req) return false;
+        if (!app.pc) app.pc = loadPolygonClipping(app.req);
+        if (!app.SvcClass) hookEditorService(app.req);
+        return !!(app.pc && app.SvcClass);
+    }
+
+    function tick() {
+        injectStyles();
+        tryBridge();
+        ensureLeftPanelItem();
+        ensureRightPanelTab();
+        if (isSettingsTabOpen()) {
+            state.ui.tabBody && state.ui.tabBody.classList.add('sa-pb-hidden-body');
+        }
+    }
+
+    function boot() {
+        injectStyles();
+        watchNativeToolClicks();
+        installCanvasHandlers();
+
+        // The editor mounts asynchronously and Angular re-renders both panels on
+        // navigation, so keep re-asserting our nodes rather than injecting once.
+        setInterval(tick, 800);
+        tick();
+
+        LOG('loaded — right-click the brush in the left panel for the tool list');
+    }
+
+    boot();
+})();
