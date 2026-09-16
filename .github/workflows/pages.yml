@@ -1,0 +1,84 @@
+name: Deploy to GitHub Pages
+
+# Publishes the JS files to Pages byte-for-byte, with no HTML wrapper.
+#
+# What that gets you: every file is fetchable at
+#   https://<owner>.github.io/<repo>/<file>.js
+# so it can be `import`ed, loaded with <script src>, or installed by
+# Tampermonkey (.user.js) straight from the Pages URL.
+#
+# What it cannot do: make the browser RUN superannotate-mask-editor.js by
+# visiting its URL. Browsers only execute JS that a *document* pulls in;
+# navigating to a .js URL shows the source instead. That is a browser rule,
+# not a Pages limitation — the editor needs a one-line HTML entry to boot
+# (see the commented-out step below), because it is also an ES module and so
+# has to be loaded with type="module".
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'superannotate-mask-editor.js'
+      - 'sa-paintbrush.user.js'
+      - 'assets/**'
+      - 'site/**'
+      - '.github/workflows/pages.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Let a run in progress finish rather than cancelling it — a half-applied
+# deployment would leave the site serving a mix of old and new files.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Assemble the site
+        run: |
+          set -euo pipefail
+          mkdir -p _site
+
+          # The files themselves, unmodified.
+          cp superannotate-mask-editor.js _site/
+          cp sa-paintbrush.user.js _site/
+
+          # The bundle lazy-loads chunks through __vite__mapDeps
+          # (assets/index4.js, assets/core.js, ...). They are not in the repo
+          # today; copy them when they are, so those code paths stop 404-ing.
+          if [ -d assets ]; then
+            cp -r assets _site/assets
+          else
+            echo "::warning::No assets/ directory — the bundle's lazily imported chunks will 404 at runtime."
+          fi
+
+          # Optional: drop an index.html in site/ and it gets published as the
+          # site root. Without one the root URL 404s while the files above are
+          # still served normally.
+          if [ -f site/index.html ]; then
+            cp site/index.html _site/index.html
+          fi
+
+          ls -la _site
+
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
