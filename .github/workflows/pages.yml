@@ -1,9 +1,9 @@
 name: Deploy to GitHub Pages
 
-# Publishes the JS files to Pages byte-for-byte, with no HTML wrapper.
+# Publishes the editor's JS and CSS to Pages byte-for-byte, with no HTML wrapper.
 #
 # What that gets you: every file is fetchable at
-#   https://<owner>.github.io/<repo>/<file>.js
+#   https://<owner>.github.io/<repo>/<file>
 # so it can be `import`ed, loaded with <script src>, or installed by
 # Tampermonkey (.user.js) straight from the Pages URL.
 #
@@ -18,6 +18,7 @@ on:
     branches: [main]
     paths:
       - 'superannotate-mask-editor.js'
+      - 'superannotate-index.css'
       - 'sa-paintbrush.user.js'
       - 'assets/**'
       - 'site/**'
@@ -48,6 +49,7 @@ jobs:
 
           # The files themselves, unmodified.
           cp superannotate-mask-editor.js _site/
+          cp superannotate-index.css _site/
           cp sa-paintbrush.user.js _site/
 
           # The bundle lazy-loads chunks through __vite__mapDeps

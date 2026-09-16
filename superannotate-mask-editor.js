@@ -45915,6 +45915,20 @@ const EYE_OPEN_SVG = `<svg width="16" height="16" viewBox="0 0 24 24" fill="none
 const EYE_CLOSED_SVG = `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/></svg>`;
 const PANEL_ROW_EYE_OPEN_SVG = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>`;
 const PANEL_ROW_EYE_CLOSED_SVG = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/></svg>`;
+/* Tri-state per-instance isolation, shown beside the eye:
+ *   0 off      — normal view
+ *   1 isolate  — only the image under this instance is shown, its own overlay
+ *                erased so you see the raw pixels behind it
+ *   2 cutout   — the inverse: everything under this instance is blanked out
+ */
+const PANEL_ROW_ISO_OFF_SVG = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/></svg>`;
+const PANEL_ROW_ISO_ONLY_SVG = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 3h18v18H3z" opacity="0.25"/><circle cx="12" cy="12" r="5" fill="currentColor" stroke="none"/><rect x="3" y="3" width="18" height="18" rx="2"/></svg>`;
+const PANEL_ROW_ISO_CUT_SVG = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 3h18v18H3z" fill="currentColor" fill-opacity="0.35" stroke="none"/><circle cx="12" cy="12" r="5" fill="none" stroke="currentColor" stroke-dasharray="3 2"/><rect x="3" y="3" width="18" height="18" rx="2"/></svg>`;
+const PANEL_ROW_ISO_STATES = [
+  { icon: PANEL_ROW_ISO_OFF_SVG, cls: "", title: "Isolate: off — click to show only the image under this instance" },
+  { icon: PANEL_ROW_ISO_ONLY_SVG, cls: " editor-panel-row-iso-only", title: "Isolate: showing only this instance's pixels — click to invert" },
+  { icon: PANEL_ROW_ISO_CUT_SVG, cls: " editor-panel-row-iso-cut", title: "Isolate: hiding this instance's pixels — click to turn off" }
+];
 const FRAME_STATUS_META = {
   not_started: {
     label: "Not Started",
@@ -46250,6 +46264,8 @@ const _EditorScreen = class _EditorScreen {
     __publicField(this, "panStart", { x: 0, y: 0 });
     __publicField(this, "rubberBand", null);
     __publicField(this, "hiddenInstanceIds", /* @__PURE__ */ new Set());
+    // instanceId -> 1 (isolate) | 2 (cutout). Absent means off.
+    __publicField(this, "isolatedInstanceIds", /* @__PURE__ */ new Map());
     __publicField(this, "allAnnotationsHidden", false);
     __publicField(this, "panelClassFilter", /* @__PURE__ */ new Set());
     __publicField(this, "panelImageFilter", /* @__PURE__ */ new Set());
@@ -55576,6 +55592,8 @@ const _EditorScreen = class _EditorScreen {
           const relCls = hasRels ? "editor-panel-row-relationship-active" : "editor-panel-row-relationship-empty";
           relBtn = `<button type="button" class="editor-panel-row-relationship ${relCls}" data-inst-id="${this.escapeAttr(inst.id)}" data-image-id="${this.escapeAttr(imgId)}" title="Relationships">${relIconSvg}</button>`;
         }
+        const isoMode = this.isolatedInstanceIds.get(inst.id) ?? 0;
+        const isoState = PANEL_ROW_ISO_STATES[isoMode];
         const isViewOnly = this.isClassViewOnly(inst.classId);
         let dragHandleHtml = "";
         if (canReorder) {
@@ -55588,7 +55606,7 @@ const _EditorScreen = class _EditorScreen {
         const copyIdBtn = relEnabled && relTypes.length > 0 ? `<button type="button" class="editor-panel-row-copyid" data-copy-inst-id="${this.escapeAttr(inst.id)}" title="Copy ID: ${this.escapeAttr(inst.id)}">${copyIdSvg}</button>` : "";
         rows += `
                     <li class="editor-panel-row ${selected ? "selected" : ""}${!visible ? " editor-panel-row-hidden" : ""}${canReorder && !isViewOnly ? " editor-panel-row-draggable" : ""}" data-inst-id="${this.escapeAttr(inst.id)}" data-image-id="${this.escapeAttr(imgId)}" role="button" tabindex="0" ${canReorder && !isViewOnly ? 'draggable="true"' : ""}>
-                        ${dragHandleHtml}<button type="button" class="editor-panel-row-eye ${visible ? "" : "editor-panel-row-eye-hidden"}" data-inst-id="${this.escapeAttr(inst.id)}" data-image-id="${this.escapeAttr(imgId)}" aria-label="${visible ? "Hide" : "Show"}" title="${visible ? "Hide" : "Show"}">${visible ? PANEL_ROW_EYE_OPEN_SVG : PANEL_ROW_EYE_CLOSED_SVG}</button>
+                        ${dragHandleHtml}<button type="button" class="editor-panel-row-eye ${visible ? "" : "editor-panel-row-eye-hidden"}" data-inst-id="${this.escapeAttr(inst.id)}" data-image-id="${this.escapeAttr(imgId)}" aria-label="${visible ? "Hide" : "Show"}" title="${visible ? "Hide" : "Show"}">${visible ? PANEL_ROW_EYE_OPEN_SVG : PANEL_ROW_EYE_CLOSED_SVG}</button><button type="button" class="editor-panel-row-iso${isoState.cls}" data-inst-id="${this.escapeAttr(inst.id)}" data-image-id="${this.escapeAttr(imgId)}" aria-label="${this.escapeAttr(isoState.title)}" title="${this.escapeAttr(isoState.title)}" aria-pressed="${isoMode !== 0}">${isoState.icon}</button>
                         ${copyIdBtn}<button type="button" class="editor-panel-row-class-btn${isViewOnly ? " editor-panel-row-class-btn-disabled" : ""}" data-inst-id="${this.escapeAttr(inst.id)}" data-image-id="${this.escapeAttr(imgId)}"><span class="editor-panel-row-swatch" style="background:${this.escapeAttr(color)}"></span><span class="editor-panel-row-class-label">${this.escapeHtml(className)}</span>${isViewOnly ? "" : '<span class="editor-panel-row-class-chevron">▼</span>'}</button>
                         <span class="editor-panel-row-idx">#${idx + 1}</span><span class="editor-panel-row-actions">${commentBtn}${relBtn}${targetBtn}${infoBtn}</span>
                     </li>`;
@@ -55701,6 +55719,16 @@ const _EditorScreen = class _EditorScreen {
       if (!instId || !imgId) return;
       rowEl.addEventListener("click", (e) => {
         const target = e.target;
+        if (target.closest(".editor-panel-row-iso")) {
+          this.cycleInstanceIsolation(instId);
+          this.drawOverlay();
+          onRerender();
+          if (this.splitValue > 0) {
+            if (this.viewMode === "objects") this.renderObjectView();
+            else this.renderCatalogView();
+          }
+          return;
+        }
         if (target.closest(".editor-panel-row-eye")) {
           if (this.hiddenInstanceIds.has(instId)) {
             this.hiddenInstanceIds.delete(instId);
@@ -71780,6 +71808,7 @@ const _EditorScreen = class _EditorScreen {
       ctx.fillStyle = "rgba(66, 113, 255, 0.08)";
       ctx.fillRect(rb.x * imgW, rb.y * imgH, rb.w * imgW, rb.h * imgH);
     }
+    this.drawInstanceIsolation(ctx, imgW, imgH);
     this.drawFillPreview(ctx, imgW, imgH);
     if (this.tool === "mask" && this.maskMouseNorm) {
       const mx = this.maskMouseNorm.x * imgW;
@@ -71878,6 +71907,132 @@ const _EditorScreen = class _EditorScreen {
     }
     this.updateImageSlider();
     this.updateSam2TrackingPopup();
+  }
+  /**
+   * Backdrop used to blank out hidden pixels. Sampled from the live DOM so it
+   * matches whatever theme the app is in, rather than being hard-coded.
+   */
+  getIsolationBackdrop() {
+    let node = this.overlayCanvas ? this.overlayCanvas.parentElement : null;
+    while (node) {
+      const bg = window.getComputedStyle(node).backgroundColor;
+      if (bg && bg !== "transparent" && !/^rgba\(0,\s*0,\s*0,\s*0\)$/.test(bg)) return bg;
+      node = node.parentElement;
+    }
+    return "#14161a";
+  }
+  /**
+   * An offscreen canvas at image resolution with this instance's region opaque
+   * and everything else transparent. Used as a stencil: only its alpha matters.
+   * Returns null for shapes with no fillable area (keypoints, polylines).
+   */
+  buildInstanceStencil(inst, imgW, imgH) {
+    const canvas = document.createElement("canvas");
+    canvas.width = imgW;
+    canvas.height = imgH;
+    const c2 = canvas.getContext("2d");
+    if (inst.type === "mask") {
+      const buf = this.getMaskBuffer(inst);
+      if (!buf || buf.length !== imgW * imgH) return null;
+      const imageData = c2.createImageData(imgW, imgH);
+      const d3 = imageData.data;
+      for (let i = 0; i < buf.length; i++) {
+        if (buf[i] === 1) d3[i * 4 + 3] = 255;
+      }
+      c2.putImageData(imageData, 0, 0);
+      return canvas;
+    }
+    c2.fillStyle = "#fff";
+    if (inst.type === "polygon" && inst.points && inst.points.length >= 3) {
+      c2.beginPath();
+      c2.moveTo(inst.points[0].x * imgW, inst.points[0].y * imgH);
+      for (let i = 1; i < inst.points.length; i++) {
+        c2.lineTo(inst.points[i].x * imgW, inst.points[i].y * imgH);
+      }
+      c2.closePath();
+      c2.fill();
+      return canvas;
+    }
+    // Everything else with a rectangular extent (bbox, and obbox/cuboid via
+    // their bounding box) falls back to that rectangle.
+    const b = inst.bbox;
+    if (b && b.width > 0 && b.height > 0) {
+      c2.fillRect(b.x * imgW, b.y * imgH, b.width * imgW, b.height * imgH);
+      return canvas;
+    }
+    return null;
+  }
+  /**
+   * Apply the tri-state isolation toggles.
+   *
+   * Runs after the instance overlays, inside the viewport transform, so:
+   *  - isolate (1): paint the backdrop over the whole image, then erase the
+   *    instance's region with destination-out. That reveals the untouched
+   *    image inside the region and takes the class overlay with it, which is
+   *    what "show the image behind" means.
+   *  - cutout (2): paint the backdrop over the region only, hiding both the
+   *    image there and the overlay on top of it.
+   *
+   * Several instances can be toggled at once: isolate is a union (all isolated
+   * regions stay visible) and cutout is applied on top of it.
+   */
+  drawInstanceIsolation(ctx, imgW, imgH) {
+    if (!this.isolatedInstanceIds || this.isolatedInstanceIds.size === 0) return;
+    if (!imgW || !imgH) return;
+
+    const isolate = [];
+    const cutout = [];
+    for (const [instId, mode] of this.isolatedInstanceIds) {
+      const inst = this.instances.find((i) => i.id === instId);
+      if (!inst) {
+        // Instance deleted while isolated — forget it rather than accumulate.
+        this.isolatedInstanceIds.delete(instId);
+        continue;
+      }
+      if (this.hiddenInstanceIds.has(instId)) continue;
+      const stencil = this.buildInstanceStencil(inst, imgW, imgH);
+      if (!stencil) continue;
+      (mode === 2 ? cutout : isolate).push(stencil);
+    }
+    if (!isolate.length && !cutout.length) return;
+
+    const backdrop = this.getIsolationBackdrop();
+    ctx.save();
+    if (isolate.length) {
+      // Union the regions to keep, so one backdrop pass covers everything else.
+      const keep = document.createElement("canvas");
+      keep.width = imgW;
+      keep.height = imgH;
+      const kctx = keep.getContext("2d");
+      for (const stencil of isolate) kctx.drawImage(stencil, 0, 0);
+
+      ctx.globalCompositeOperation = "source-over";
+      ctx.fillStyle = backdrop;
+      ctx.fillRect(0, 0, imgW, imgH);
+      ctx.globalCompositeOperation = "destination-out";
+      ctx.drawImage(keep, 0, 0);
+    }
+    if (cutout.length) {
+      ctx.globalCompositeOperation = "source-over";
+      const tint = document.createElement("canvas");
+      tint.width = imgW;
+      tint.height = imgH;
+      const tctx = tint.getContext("2d");
+      for (const stencil of cutout) tctx.drawImage(stencil, 0, 0);
+      tctx.globalCompositeOperation = "source-in";
+      tctx.fillStyle = backdrop;
+      tctx.fillRect(0, 0, imgW, imgH);
+      ctx.drawImage(tint, 0, 0);
+    }
+    ctx.restore();
+  }
+  /** Cycle one instance through off -> isolate -> cutout -> off. */
+  cycleInstanceIsolation(instId) {
+    const current = this.isolatedInstanceIds.get(instId) ?? 0;
+    const next = (current + 1) % 3;
+    if (next === 0) this.isolatedInstanceIds.delete(instId);
+    else this.isolatedInstanceIds.set(instId, next);
+    return next;
   }
   /** Tinted overlay showing what a right click would fill. */
   drawFillPreview(ctx, imgW, imgH) {
