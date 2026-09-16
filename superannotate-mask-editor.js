@@ -64020,9 +64020,15 @@ const _EditorScreen = class _EditorScreen {
       const px = Math.round(norm.x * imgW);
       const py = Math.round(norm.y * imgH);
       if (this.maskMode === "fill") {
-        // Preview only — nothing is painted and no instance is created until
-        // the user confirms with a right click.
-        this.startFillPreview(px, py);
+        // Left button only. mousedown fires for every button here, so without
+        // this guard the right click that is meant to COMMIT would first
+        // re-seed the preview from whatever pixel it landed on, and then
+        // commit that instead of what the user was looking at.
+        if (e.button === 0) {
+          // Preview only — nothing is painted and no instance is created
+          // until the user confirms with a right click.
+          this.startFillPreview(px, py);
+        }
         return;
       }
       let targetInst = null;
@@ -69612,6 +69618,10 @@ const _EditorScreen = class _EditorScreen {
       this.drawOverlay();
       return;
     }
+    // Undo snapshots read inst.mask (RLE), not the live paint buffer, so the
+    // buffer has to be encoded back onto the instance first — exactly what the
+    // brush does on mouseup before its own pushUndo().
+    this.flushMaskToInstance(targetInst.id);
     this.activeMaskCanvas = null;
     this.cachedMaskImageData = null;
     this.pushUndo();
@@ -71770,6 +71780,7 @@ const _EditorScreen = class _EditorScreen {
       ctx.fillStyle = "rgba(66, 113, 255, 0.08)";
       ctx.fillRect(rb.x * imgW, rb.y * imgH, rb.w * imgW, rb.h * imgH);
     }
+    this.drawFillPreview(ctx, imgW, imgH);
     if (this.tool === "mask" && this.maskMouseNorm) {
       const mx = this.maskMouseNorm.x * imgW;
       const my = this.maskMouseNorm.y * imgH;
@@ -71865,7 +71876,6 @@ const _EditorScreen = class _EditorScreen {
       }
       ctx.restore();
     }
-    this.drawFillPreview(ctx, imgW, imgH);
     this.updateImageSlider();
     this.updateSam2TrackingPopup();
   }
