@@ -72382,11 +72382,20 @@ const _EditorScreen = class _EditorScreen {
       // GLSL ES 1.00 so the same source works on a webgl2 or webgl1 context.
       const vsSrc = `
         attribute vec2 a_pos;
+        uniform float u_flip;
         varying vec2 v_uv;
         void main() {
-          // Flip V: row 0 of a mask is the top of the image, texture v=0 is
-          // the first uploaded row, and clip-space y=+1 is the top of the view.
-          v_uv = vec2((a_pos.x + 1.0) * 0.5, 1.0 - (a_pos.y + 1.0) * 0.5);
+          // Uploaded textures need V flipped: row 0 of a mask is the top of the
+          // image, texture v=0 is the first uploaded row, and clip-space y=+1 is
+          // the top of the view.
+          //
+          // The FBO texture does NOT. A framebuffer has origin bottom-left, so
+          // rendering into the colour attachment already stores it upside down
+          // relative to an uploaded texture; flipping again on the way out is
+          // what made isolate mode render inverted while cutout — which never
+          // touches the FBO — stayed correct.
+          float t = (a_pos.y + 1.0) * 0.5;
+          v_uv = vec2((a_pos.x + 1.0) * 0.5, mix(t, 1.0 - t, u_flip));
           gl_Position = vec4(a_pos, 0.0, 1.0);
         }`;
       const fsSrc = `
@@ -72459,6 +72468,7 @@ const _EditorScreen = class _EditorScreen {
         locChan: gl.getUniformLocation(prog, "u_chan"),
         locColor: gl.getUniformLocation(prog, "u_color"),
         locInvert: gl.getUniformLocation(prog, "u_invert"),
+        locFlip: gl.getUniformLocation(prog, "u_flip"),
         maxTexture: gl.getParameter(gl.MAX_TEXTURE_SIZE) || 2048,
         sized: ""
       };
@@ -72504,13 +72514,18 @@ const _EditorScreen = class _EditorScreen {
     }
     return state;
   }
-  /** Draw one full-screen quad sampling `tex`. */
-  drawCutoutQuad(state, tex, chan, color, invert) {
+  /**
+   * Draw one full-screen quad sampling `tex`.
+   * `flip` is 1 for an uploaded texture and 0 for the FBO attachment, which is
+   * already stored bottom-up.
+   */
+  drawCutoutQuad(state, tex, chan, color, invert, flip = 1) {
     const gl = state.gl;
     gl.bindTexture(gl.TEXTURE_2D, tex);
     gl.uniform4fv(state.locChan, chan);
     gl.uniform3fv(state.locColor, color);
     gl.uniform1f(state.locInvert, invert);
+    gl.uniform1f(state.locFlip, flip);
     gl.drawArrays(gl.TRIANGLES, 0, 6);
   }
   /**
@@ -72581,7 +72596,7 @@ const _EditorScreen = class _EditorScreen {
           // 2. punch that union out of the overlay, revealing the raw image
           //    and taking the class overlay with it
           gl.clear(gl.COLOR_BUFFER_BIT);
-          this.drawCutoutQuad(state, state.unionTex, CHAN_A, WHITE, 0);
+          this.drawCutoutQuad(state, state.unionTex, CHAN_A, WHITE, 0, 0);
           ctx.globalCompositeOperation = "destination-out";
           ctx.drawImage(state.canvas, 0, 0, imgW, imgH);
         }
@@ -72591,7 +72606,7 @@ const _EditorScreen = class _EditorScreen {
       gl.clear(gl.COLOR_BUFFER_BIT);
       let anyCovered = false;
       if (drewIsolate) {
-        this.drawCutoutQuad(state, state.unionTex, CHAN_A, rgb, 1);
+        this.drawCutoutQuad(state, state.unionTex, CHAN_A, rgb, 1, 0);
         anyCovered = true;
       }
       for (const inst of cutoutInsts) {
