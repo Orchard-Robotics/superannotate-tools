@@ -6218,6 +6218,15 @@ hr.editor-info-tooltip-sep {
     margin-left: 0.25rem;
     cursor: help;
 }
+.editor-mask-sel-clear {
+    margin-left: auto;
+}
+.editor-mask-fill-hint {
+    margin-top: 0.35rem;
+    font-size: 0.7rem;
+    line-height: 1.45;
+    color: var(--n-600);
+}
 .editor-adjust-color-wrap {
     display: flex;
     align-items: center;

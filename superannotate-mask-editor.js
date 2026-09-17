@@ -46350,6 +46350,12 @@ const _EditorScreen = class _EditorScreen {
     __publicField(this, "keypointSize", 5);
     // Colour painted over pixels the isolation toggle hides.
     __publicField(this, "cutoutColor", "#000000");
+    // When true every mask tool edits the selection buffer instead of an
+    // annotation. The selection itself lives on the image entry, so it is
+    // per-frame and can ride along in the undo snapshots.
+    __publicField(this, "maskTargetSelection", false);
+    __publicField(this, "maskPaintingSelection", false);
+    __publicField(this, "maskSelectionCanvas", null);
     __publicField(this, "darkModeCanvas", null);
     __publicField(this, "darkModeCacheKey", "");
     __publicField(this, "showClassesOnHover", true);
@@ -46669,6 +46675,14 @@ const _EditorScreen = class _EditorScreen {
         if (this.keypointEditingInstId && !inEditable) {
           e.preventDefault();
           this.handleKeypointHintDelete();
+          return;
+        }
+        // With a live selection, Delete/Backspace subtracts the selected area
+        // from annotations instead of deleting whole objects. Gated on the
+        // selection existing so the normal delete is untouched without one.
+        if (!inEditable && this.tool === "mask" && this.hasMaskSelection()) {
+          e.preventDefault();
+          this.deleteSelectionFromAnnotations();
           return;
         }
         if (this.selectedIds.size > 0 && !inEditable) {
@@ -64094,6 +64108,47 @@ const _EditorScreen = class _EditorScreen {
         }
         return;
       }
+      if (this.maskTargetSelection) {
+        // Editing the selection itself: no instance is targeted or created,
+        // and nothing clips the stroke — the selection IS the clip.
+        const selBuf = this.getSelectionBuffer(true);
+        if (!selBuf) return;
+        this.maskPaintInstId = null;
+        this.maskPaintInstIsNew = false;
+        if (this.maskBrushShape === "box") {
+          const clampedStart = clampNormalized(norm.x, norm.y);
+          this.bboxDrawing = { x: clampedStart.x, y: clampedStart.y, w: 0, h: 0 };
+          this.dragStartNorm = { x: clampedStart.x, y: clampedStart.y };
+          this.isDragging = true;
+          this.maskPaintingSelection = true;
+          this.drawOverlay();
+          return;
+        }
+        if (this.maskBrushShape === "polygon") {
+          if (this.polygonDrawing.length >= 3) {
+            const first = this.polygonDrawing[0];
+            const closeR = Math.min(_EditorScreen.POLY_CLOSE_SNAP_NORM_MAX, this.screenPxToNorm(_EditorScreen.POLY_CLOSE_SNAP_PX));
+            if (Math.hypot(norm.x - first.x, norm.y - first.y) < closeR) {
+              this.finishMaskPolygon();
+              return;
+            }
+          }
+          this.freehandStartIdx = this.polygonDrawing.length;
+          this.polygonDrawing.push({ ...norm });
+          this.isPolygonFreehand = true;
+          this.isDragging = true;
+          this.maskPaintingSelection = true;
+          this.drawOverlay();
+          return;
+        }
+        this.maskPainting = true;
+        this.maskPaintingSelection = true;
+        this.maskStrokeClaimed = null;
+        this.paintMask(selBuf, px, py, this.maskBrushSize / 2, this.maskBrushShape, this.maskMode === "eraser", imgW, imgH, null, null);
+        this.maskLastPaintPos = { x: px, y: py };
+        this.drawOverlay();
+        return;
+      }
       let targetInst = null;
       let createdNewMaskInstance = false;
       if (this.maskSegMode === "semantic") {
@@ -64170,7 +64225,7 @@ const _EditorScreen = class _EditorScreen {
       this.maskStrokeClaimed = this.maskMode === "clip" ? this.buildClipClaimMask() : null;
       const buf = this.getMaskBuffer(targetInst);
       const halfBrush = this.maskBrushSize / 2;
-      this.paintMask(buf, px, py, halfBrush, this.maskBrushShape, this.maskMode === "eraser", imgW, imgH, this.maskStrokeClaimed);
+      this.paintMask(buf, px, py, halfBrush, this.maskBrushShape, this.maskMode === "eraser", imgW, imgH, this.maskStrokeClaimed, this.getMaskSelectionClip());
       this.maskLastPaintPos = { x: px, y: py };
       this.activeMaskCanvas = null;
       this.cachedMaskImageData = null;
@@ -64834,14 +64889,16 @@ const _EditorScreen = class _EditorScreen {
       this.maskMouseNorm = { ...norm };
       this.drawOverlay();
     }
-    if (this.maskPainting && this.maskPaintInstId) {
+    if (this.maskPainting && (this.maskPaintInstId || this.maskPaintingSelection)) {
       const imgW = this.viewport.imageNaturalWidth;
       const imgH = this.viewport.imageNaturalHeight;
       const px = Math.round(norm.x * imgW);
       const py = Math.round(norm.y * imgH);
-      const inst = this.instances.find((i) => i.id === this.maskPaintInstId);
-      if (inst) {
-        const buf = this.getMaskBuffer(inst);
+      const inst = this.maskPaintingSelection ? null : this.instances.find((i) => i.id === this.maskPaintInstId);
+      const selBuf = this.maskPaintingSelection ? this.getSelectionBuffer(true) : null;
+      const clip = this.maskPaintingSelection ? null : this.getMaskSelectionClip();
+      if (inst || selBuf) {
+        const buf = this.maskPaintingSelection ? selBuf : this.getMaskBuffer(inst);
         const halfBrush = this.maskBrushSize / 2;
         if (this.maskLastPaintPos) {
           const lx = this.maskLastPaintPos.x;
@@ -64853,10 +64910,10 @@ const _EditorScreen = class _EditorScreen {
             const t = s / steps;
             const ix = Math.round(lx + (px - lx) * t);
             const iy = Math.round(ly + (py - ly) * t);
-            this.paintMask(buf, ix, iy, halfBrush, this.maskBrushShape, this.maskMode === "eraser", imgW, imgH, this.maskStrokeClaimed);
+            this.paintMask(buf, ix, iy, halfBrush, this.maskBrushShape, this.maskMode === "eraser", imgW, imgH, this.maskStrokeClaimed, clip);
           }
         } else {
-          this.paintMask(buf, px, py, halfBrush, this.maskBrushShape, this.maskMode === "eraser", imgW, imgH, this.maskStrokeClaimed);
+          this.paintMask(buf, px, py, halfBrush, this.maskBrushShape, this.maskMode === "eraser", imgW, imgH, this.maskStrokeClaimed, clip);
         }
         this.maskLastPaintPos = { x: px, y: py };
         this.activeMaskCanvas = null;
@@ -65176,6 +65233,18 @@ const _EditorScreen = class _EditorScreen {
       }
       return;
     }
+    if (this.maskPainting && this.maskPaintingSelection) {
+      // Selection strokes touch no instance, so there is nothing to flush —
+      // but the edit is still undoable, per the same one-push-per-stroke rule
+      // the brush follows.
+      this.maskPainting = false;
+      this.maskPaintingSelection = false;
+      this.maskLastPaintPos = null;
+      this.maskStrokeClaimed = null;
+      this.pushUndo();
+      this.drawOverlay();
+      return;
+    }
     if (this.maskPainting && this.maskPaintInstId) {
       const paintedId = this.maskPaintInstId;
       this.flushMaskToInstance(paintedId);
@@ -65203,6 +65272,21 @@ const _EditorScreen = class _EditorScreen {
       const bh = Math.min(this.bboxDrawing.h, 1 - by);
       const wasNew = this.maskPaintInstIsNew;
       this.maskPaintInstIsNew = false;
+      if (this.maskTargetSelection) {
+        const selBuf = this.getSelectionBuffer(true);
+        this.bboxDrawing = null;
+        this.isDragging = false;
+        this.maskPaintingSelection = false;
+        if (selBuf && bw > 5e-3 && bh > 5e-3) {
+          this.rasterizeRectToMask(
+            selBuf, bx, by, bw, bh, this.maskMode === "eraser",
+            this.viewport.imageNaturalWidth, this.viewport.imageNaturalHeight, null, null
+          );
+          this.pushUndo();
+        }
+        this.drawOverlay();
+        return;
+      }
       if (bw > 5e-3 && bh > 5e-3 && this.maskPaintInstId) {
         const inst = this.instances.find((i) => i.id === this.maskPaintInstId);
         if (inst) {
@@ -65210,7 +65294,7 @@ const _EditorScreen = class _EditorScreen {
           const imgH = this.viewport.imageNaturalHeight;
           const buf = this.getMaskBuffer(inst);
           const claimed = this.buildClipClaimMask();
-          this.rasterizeRectToMask(buf, bx, by, bw, bh, this.maskMode === "eraser", imgW, imgH, claimed);
+          this.rasterizeRectToMask(buf, bx, by, bw, bh, this.maskMode === "eraser", imgW, imgH, claimed, this.getMaskSelectionClip());
           this.flushMaskToInstance(inst.id);
           this.activeMaskCanvas = null;
           this.cachedMaskImageData = null;
@@ -66458,6 +66542,22 @@ const _EditorScreen = class _EditorScreen {
   }
   finishMaskPolygon() {
     if (this.polygonDrawing.length < 3) return;
+    if (this.maskTargetSelection) {
+      const selBuf = this.getSelectionBuffer(true);
+      const drawnPointsSel = this.polygonDrawing.map((p3) => clampNormalized(p3.x, p3.y));
+      this.polygonDrawing = [];
+      this.isPolygonFreehand = false;
+      this.maskPaintingSelection = false;
+      if (selBuf) {
+        this.rasterizePolygonToMask(
+          selBuf, drawnPointsSel, this.maskMode === "eraser",
+          this.viewport.imageNaturalWidth, this.viewport.imageNaturalHeight, null, null
+        );
+        this.pushUndo();
+      }
+      this.drawOverlay();
+      return;
+    }
     if (!this.maskPaintInstId) return;
     const inst = this.instances.find((i) => i.id === this.maskPaintInstId);
     if (!inst) return;
@@ -66466,7 +66566,7 @@ const _EditorScreen = class _EditorScreen {
     const imgH = this.viewport.imageNaturalHeight;
     const buf = this.getMaskBuffer(inst);
     const claimed = this.buildClipClaimMask();
-    this.rasterizePolygonToMask(buf, drawnPoints, this.maskMode === "eraser", imgW, imgH, claimed);
+    this.rasterizePolygonToMask(buf, drawnPoints, this.maskMode === "eraser", imgW, imgH, claimed, this.getMaskSelectionClip());
     this.flushMaskToInstance(inst.id);
     this.activeMaskCanvas = null;
     this.cachedMaskImageData = null;
@@ -66498,8 +66598,24 @@ const _EditorScreen = class _EditorScreen {
     this.renderAnnotationPanel();
     this.triggerAiForInstance(inst);
   }
+  /** Snapshot the frame's selection. RLE keeps a full-res buffer small. */
+  snapshotSelection(entry) {
+    const buf = entry.maskSelection;
+    if (!buf) return null;
+    const w2 = this.viewport.imageNaturalWidth;
+    const h2 = this.viewport.imageNaturalHeight;
+    if (!w2 || !h2 || buf.length !== w2 * h2) return null;
+    return encodeMaskToRLE(buf, w2, h2);
+  }
+  /** Inverse of snapshotSelection, applied to an entry during undo/redo. */
+  restoreSelection(entry, snapshot) {
+    entry.maskSelection = snapshot ? decodeMaskFromRLE(snapshot) : null;
+  }
   pushUndoForEntry(entry, trackInJournal = true) {
-    entry.undoStack.push({ instances: entry.instances.map((i) => this.cloneInstance(i)) });
+    entry.undoStack.push({
+      instances: entry.instances.map((i) => this.cloneInstance(i)),
+      selection: this.snapshotSelection(entry)
+    });
     if (entry.undoStack.length > _EditorScreen.MAX_UNDO) {
       entry.undoStack.splice(0, entry.undoStack.length - _EditorScreen.MAX_UNDO);
     }
@@ -66600,8 +66716,13 @@ const _EditorScreen = class _EditorScreen {
     if (this.undoStack.length <= 1) return;
     this.undoStack.pop();
     const prev = this.undoStack[this.undoStack.length - 1];
-    this.redoStack.push({ instances: this.instances.map((i) => this.cloneInstance(i)) });
+    const activeEntry = this.getActiveImage();
+    this.redoStack.push({
+      instances: this.instances.map((i) => this.cloneInstance(i)),
+      selection: activeEntry ? this.snapshotSelection(activeEntry) : null
+    });
     this.instances = prev.instances.map((i) => this.cloneInstance(i));
+    if (activeEntry) this.restoreSelection(activeEntry, prev.selection);
     this.maskBuffers.clear();
     this.maskBboxCache.clear();
     this.activeMaskCanvas = null;
@@ -66620,7 +66741,11 @@ const _EditorScreen = class _EditorScreen {
       if (img.undoStack.length <= 1) continue;
       img.undoStack.pop();
       const prev = img.undoStack[img.undoStack.length - 1];
-      img.redoStack.push({ instances: img.instances.map((i) => this.cloneInstance(i)) });
+      img.redoStack.push({
+        instances: img.instances.map((i) => this.cloneInstance(i)),
+        selection: this.snapshotSelection(img)
+      });
+      this.restoreSelection(img, prev.selection);
       img.instances = prev.instances.map((i) => this.cloneInstance(i));
     }
     const activeImg = this.getActiveImage();
@@ -66679,11 +66804,16 @@ const _EditorScreen = class _EditorScreen {
     if (this.redoStack.length === 0) return;
     const next = this.redoStack.pop();
     const stack = this.undoStack;
-    stack.push({ instances: this.instances.map((i) => this.cloneInstance(i)) });
+    const activeEntry = this.getActiveImage();
+    stack.push({
+      instances: this.instances.map((i) => this.cloneInstance(i)),
+      selection: activeEntry ? this.snapshotSelection(activeEntry) : null
+    });
     if (stack.length > _EditorScreen.MAX_UNDO) {
       stack.splice(0, stack.length - _EditorScreen.MAX_UNDO);
     }
     this.instances = next.instances.map((i) => this.cloneInstance(i));
+    if (activeEntry) this.restoreSelection(activeEntry, next.selection);
     this.maskBuffers.clear();
     this.maskBboxCache.clear();
     this.activeMaskCanvas = null;
@@ -66701,11 +66831,15 @@ const _EditorScreen = class _EditorScreen {
       if (!idSet.has(img.id)) continue;
       if (img.redoStack.length === 0) continue;
       const next = img.redoStack.pop();
-      img.undoStack.push({ instances: img.instances.map((i) => this.cloneInstance(i)) });
+      img.undoStack.push({
+        instances: img.instances.map((i) => this.cloneInstance(i)),
+        selection: this.snapshotSelection(img)
+      });
       if (img.undoStack.length > _EditorScreen.MAX_UNDO) {
         img.undoStack.splice(0, img.undoStack.length - _EditorScreen.MAX_UNDO);
       }
       img.instances = next.instances.map((i) => this.cloneInstance(i));
+      this.restoreSelection(img, next.selection);
     }
     const activeImg = this.getActiveImage();
     if (activeImg && idSet.has(activeImg.id)) {
@@ -69183,6 +69317,50 @@ const _EditorScreen = class _EditorScreen {
       modeWrap.appendChild(btn);
     }
     popup.appendChild(makeRow("Mode", modeWrap));
+
+    // ── Target: annotation vs selection ──
+    // Orthogonal to Mode: brush/eraser/box/polygon/fill all obey it.
+    const targetWrap = document.createElement("div");
+    targetWrap.className = "editor-mask-mode-wrap";
+    const targetBtns = [];
+    const targetEntries = [
+      { key: false, label: "Annotation" },
+      { key: true, label: "Selection" }
+    ];
+    const selClearBtn = document.createElement("button");
+    for (const entry of targetEntries) {
+      const btn = document.createElement("button");
+      btn.className = "editor-mask-mode-btn" + (this.maskTargetSelection === entry.key ? " active" : "");
+      btn.textContent = entry.label;
+      btn.type = "button";
+      btn.title = entry.key
+        ? "Mask tools edit the selection buffer instead of annotations"
+        : "Mask tools edit annotations, clipped to the selection when one exists";
+      btn.addEventListener("click", () => {
+        this.maskTargetSelection = entry.key;
+        targetBtns.forEach((b) => b.classList.remove("active"));
+        btn.classList.add("active");
+        this.clearFillPreview();
+        this.drawOverlay();
+      });
+      targetBtns.push(btn);
+      targetWrap.appendChild(btn);
+    }
+    selClearBtn.className = "editor-mask-mode-btn editor-mask-sel-clear";
+    selClearBtn.textContent = "Clear";
+    selClearBtn.type = "button";
+    selClearBtn.title = "Clear the selection";
+    selClearBtn.addEventListener("click", () => {
+      this.clearMaskSelection(true);
+    });
+    targetWrap.appendChild(selClearBtn);
+    popup.appendChild(makeRow("Target", targetWrap));
+
+    const selHint = document.createElement("div");
+    selHint.className = "editor-mask-fill-hint";
+    selHint.textContent = "With a selection active, mask edits stay inside it. " +
+      "Delete or Backspace subtracts it from the selected instance, or from every visible annotation of the selected class.";
+    popup.appendChild(selHint);
     const shapeWrap = document.createElement("div");
     shapeWrap.className = "editor-mask-mode-wrap";
     const shapeEntries = [
@@ -69644,6 +69822,23 @@ const _EditorScreen = class _EditorScreen {
       this.clearFillPreview();
       return;
     }
+    if (this.maskTargetSelection) {
+      // Fill straight into the selection — no instance, no class involved.
+      const selBuf = this.getSelectionBuffer(true);
+      if (selBuf) {
+        const src2 = preview.mask;
+        const erase = this.maskMode === "eraser";
+        for (let i = 0; i < src2.length && i < selBuf.length; i++) {
+          if (src2[i] === 1) selBuf[i] = erase ? 0 : 1;
+        }
+        this.clearFillPreview();
+        this.pushUndo();
+        this.drawOverlay();
+        return;
+      }
+      this.clearFillPreview();
+      return;
+    }
     let targetInst = null;
     if (this.maskSegMode === "semantic") {
       targetInst = this.instances.find(
@@ -69667,10 +69862,12 @@ const _EditorScreen = class _EditorScreen {
       this.selectedIds.clear();
       this.selectedIds.add(targetInst.id);
     }
+    const clip = this.getMaskSelectionClip();
     const buf = this.getMaskBuffer(targetInst);
     const src = preview.mask;
     let painted = 0;
     for (let i = 0; i < src.length && i < buf.length; i++) {
+      if (clip && clip[i] !== 1) continue;
       if (src[i] === 1 && buf[i] !== 1) {
         buf[i] = 1;
         painted++;
@@ -69685,6 +69882,114 @@ const _EditorScreen = class _EditorScreen {
     // buffer has to be encoded back onto the instance first — exactly what the
     // brush does on mouseup before its own pushUndo().
     this.flushMaskToInstance(targetInst.id);
+    this.activeMaskCanvas = null;
+    this.cachedMaskImageData = null;
+    this.pushUndo();
+    this.drawOverlay();
+    this.renderAnnotationPanel();
+  }
+  /**
+   * The per-frame selection buffer: a Uint8Array of imgW*imgH, 1 inside the
+   * selection. Stored on the image entry so switching frames switches
+   * selections, and so undo snapshots can carry it.
+   */
+  getSelectionBuffer(create = false) {
+    const img = this.getActiveImage();
+    if (!img) return null;
+    if (!img.maskSelection && create) {
+      const w2 = this.viewport.imageNaturalWidth;
+      const h2 = this.viewport.imageNaturalHeight;
+      if (!w2 || !h2) return null;
+      img.maskSelection = new Uint8Array(w2 * h2);
+    }
+    const buf = img.maskSelection ?? null;
+    if (!buf) return null;
+    // A frame can change size (or load late); a stale buffer is worse than none.
+    const expected = this.viewport.imageNaturalWidth * this.viewport.imageNaturalHeight;
+    if (expected && buf.length !== expected) {
+      img.maskSelection = create ? new Uint8Array(expected) : null;
+      return img.maskSelection ?? null;
+    }
+    return buf;
+  }
+  /** True when a selection exists and actually covers something. */
+  hasMaskSelection() {
+    const buf = this.getSelectionBuffer(false);
+    if (!buf) return false;
+    for (let i = 0; i < buf.length; i++) if (buf[i] === 1) return true;
+    return false;
+  }
+  /**
+   * The clip mask every annotation-targeted mask edit must stay inside.
+   * Null when there is no selection, which means "no restriction".
+   */
+  getMaskSelectionClip() {
+    if (this.maskTargetSelection) return null;   // editing the selection itself
+    return this.hasMaskSelection() ? this.getSelectionBuffer(false) : null;
+  }
+  clearMaskSelection(pushUndo = true) {
+    const img = this.getActiveImage();
+    if (!img || !img.maskSelection) return;
+    img.maskSelection = null;
+    if (pushUndo) this.pushUndo();
+    this.drawOverlay();
+  }
+  /**
+   * Subtract the selected area from mask annotations.
+   *
+   * Target, in order:
+   *   1. the instance(s) currently selected for editing, if any are masks;
+   *   2. otherwise every VISIBLE mask instance of the selected class.
+   *
+   * Only mask instances are affected: the area is raster, and a class carries a
+   * single type, so a mask class never holds polygons anyway.
+   */
+  deleteSelectionFromAnnotations() {
+    const sel = this.getSelectionBuffer(false);
+    if (!sel) return;
+    const imgW = this.viewport.imageNaturalWidth;
+    const imgH = this.viewport.imageNaturalHeight;
+    if (!imgW || !imgH || sel.length !== imgW * imgH) return;
+
+    let targets = this.instances.filter(
+      (i) => i.type === "mask" && this.selectedIds.has(i.id)
+    );
+    if (targets.length === 0) {
+      targets = this.instances.filter(
+        (i) => i.type === "mask" &&
+          i.classId === this.selectedClassId &&
+          !this.hiddenInstanceIds.has(i.id)
+      );
+    }
+    if (targets.length === 0) return;
+
+    const emptied = [];
+    let changed = 0;
+    for (const inst of targets) {
+      const buf = this.getMaskBuffer(inst);
+      if (!buf || buf.length !== sel.length) continue;
+      let touched = 0;
+      let remaining = 0;
+      for (let i = 0; i < buf.length; i++) {
+        if (buf[i] !== 1) continue;
+        if (sel[i] === 1) {
+          buf[i] = 0;
+          touched++;
+        } else {
+          remaining++;
+        }
+      }
+      if (!touched) continue;
+      changed += touched;
+      this.flushMaskToInstance(inst.id);
+      if (remaining === 0) emptied.push(inst.id);
+    }
+    if (!changed) return;
+
+    // Erasing a mask down to nothing is the editor's existing "delete me"
+    // gesture, so honour it here too rather than leaving empty instances.
+    for (const id of emptied) this.deleteMaskInstanceIfEmpty(id);
+
     this.activeMaskCanvas = null;
     this.cachedMaskImageData = null;
     this.pushUndo();
@@ -69767,7 +70072,7 @@ const _EditorScreen = class _EditorScreen {
     }
     return claimed;
   }
-  paintMask(buffer, cx, cy, radius, shape, erase, imgW, imgH, claimed = null) {
+  paintMask(buffer, cx, cy, radius, shape, erase, imgW, imgH, claimed = null, allowed = null) {
     const val = erase ? 0 : 1;
     const r = Math.floor(radius);
     const x0 = Math.max(0, Math.floor(cx - r));
@@ -69784,11 +70089,13 @@ const _EditorScreen = class _EditorScreen {
         }
         const idx = y3 * imgW + x2;
         if (claimed && claimed[idx] === 1) continue;
+        // `allowed` is the active selection: outside it, nothing may change.
+        if (allowed && allowed[idx] !== 1) continue;
         buffer[idx] = val;
       }
     }
   }
-  rasterizeRectToMask(buffer, nx, ny, nw, nh, erase, imgW, imgH, claimed = null) {
+  rasterizeRectToMask(buffer, nx, ny, nw, nh, erase, imgW, imgH, claimed = null, allowed = null) {
     const val = erase ? 0 : 1;
     const x0 = Math.max(0, Math.round(nx * imgW));
     const y0 = Math.max(0, Math.round(ny * imgH));
@@ -69798,11 +70105,12 @@ const _EditorScreen = class _EditorScreen {
       for (let x2 = x0; x2 <= x1; x2++) {
         const idx = y3 * imgW + x2;
         if (claimed && claimed[idx] === 1) continue;
+        if (allowed && allowed[idx] !== 1) continue;
         buffer[idx] = val;
       }
     }
   }
-  rasterizePolygonToMask(buffer, points, erase, imgW, imgH, claimed = null) {
+  rasterizePolygonToMask(buffer, points, erase, imgW, imgH, claimed = null, allowed = null) {
     if (points.length < 3) return;
     const val = erase ? 0 : 1;
     const pixPts = points.map((p3) => ({ x: p3.x * imgW, y: p3.y * imgH }));
@@ -71866,6 +72174,7 @@ const _EditorScreen = class _EditorScreen {
       ctx.fillStyle = "rgba(66, 113, 255, 0.08)";
       ctx.fillRect(rb.x * imgW, rb.y * imgH, rb.w * imgW, rb.h * imgH);
     }
+    this.drawMaskSelection(ctx, imgW, imgH);
     this.drawInstanceIsolation(ctx, imgW, imgH);
     this.drawFillPreview(ctx, imgW, imgH);
     if (this.tool === "mask" && this.maskMouseNorm) {
@@ -72085,6 +72394,45 @@ const _EditorScreen = class _EditorScreen {
     if (next === 0) this.isolatedInstanceIds.delete(instId);
     else this.isolatedInstanceIds.set(instId, next);
     return next;
+  }
+  /**
+   * The selection, drawn as a cyan wash. Deliberately unlike any class colour
+   * so it never reads as an annotation, and only shown while the mask tool is
+   * active — it constrains mask edits and nothing else.
+   */
+  drawMaskSelection(ctx, imgW, imgH) {
+    if (this.tool !== "mask") return;
+    const sel = this.getSelectionBuffer(false);
+    if (!sel || sel.length !== imgW * imgH) return;
+
+    let osc = this.maskSelectionCanvas;
+    if (!osc || osc.width !== imgW || osc.height !== imgH) {
+      osc = document.createElement("canvas");
+      osc.width = imgW;
+      osc.height = imgH;
+      this.maskSelectionCanvas = osc;
+    }
+    // Rebuilt every frame rather than cached. The selection changes on every
+    // pointer move of a selection stroke, and the instance mask layer already
+    // refills its ImageData per frame, so this matches the existing cost and
+    // removes any chance of drawing a stale selection.
+    const octx = osc.getContext("2d");
+    const imageData = octx.createImageData(imgW, imgH);
+    const d3 = imageData.data;
+    let any = false;
+    for (let i = 0; i < sel.length; i++) {
+      if (sel[i] === 1) {
+        const off = i * 4;
+        d3[off] = 34;
+        d3[off + 1] = 211;
+        d3[off + 2] = 238;
+        d3[off + 3] = 70;
+        any = true;
+      }
+    }
+    if (!any) return;
+    octx.putImageData(imageData, 0, 0);
+    ctx.drawImage(osc, 0, 0, imgW, imgH);
   }
   /** Tinted overlay showing what a right click would fill. */
   drawFillPreview(ctx, imgW, imgH) {
