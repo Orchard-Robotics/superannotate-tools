@@ -72636,10 +72636,17 @@ const _EditorScreen = class _EditorScreen {
         // 2. dst = dst * (1 - srcAlpha): GL's destination-out, punching the
         //    kept regions back out so the image below shows through
         gl.blendFuncSeparate(gl.ZERO, gl.ONE_MINUS_SRC_ALPHA, gl.ZERO, gl.ONE_MINUS_SRC_ALPHA);
+        let punched = false;
         for (const inst of isolateInsts) {
-          this.drawCutoutInstance(state, inst, imgW, imgH, WHITE, 0);
+          if (this.drawCutoutInstance(state, inst, imgW, imgH, WHITE, 0)) punched = true;
         }
-        painted = true;
+        if (punched) {
+          painted = true;
+        } else {
+          // Nothing was cut out of the flood, which would leave the frame
+          // entirely covered. Drop the pass instead.
+          gl.clear(gl.COLOR_BUFFER_BIT);
+        }
       }
       // 3. cutout regions, over the top so they win inside an isolated area
       gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
@@ -72655,9 +72662,20 @@ const _EditorScreen = class _EditorScreen {
       return false;
     }
   }
-  /** Cheap type check: can this instance produce a stencil at all? */
-  instanceHasStencil(inst) {
-    if (inst.type === "mask") return true;
+  /**
+   * Can this instance produce a stencil for a frame of this size?
+   *
+   * The mask-buffer length check matters: isolate floods the layer with the
+   * backdrop and then punches the kept regions out of it, so an isolate list
+   * that turns out to be undrawable would blank the entire image. A buffer can
+   * legitimately mismatch while a frame is loading or after a resize.
+   */
+  instanceHasStencil(inst, imgW, imgH) {
+    if (inst.type === "mask") {
+      if (!imgW || !imgH) return true;
+      const buf = this.getMaskBuffer(inst);
+      return !!buf && buf.length === imgW * imgH;
+    }
     if (inst.type === "polygon") return !!(inst.points && inst.points.length >= 3);
     const b = inst.bbox;
     return !!(b && b.width > 0 && b.height > 0);
@@ -72679,7 +72697,7 @@ const _EditorScreen = class _EditorScreen {
         continue;
       }
       if (this.hiddenInstanceIds.has(instId)) continue;
-      if (!this.instanceHasStencil(inst)) continue;
+      if (!this.instanceHasStencil(inst, imgW, imgH)) continue;
       (mode === 2 ? cutout : isolate).push(inst);
     }
     if (!isolate.length && !cutout.length) {
