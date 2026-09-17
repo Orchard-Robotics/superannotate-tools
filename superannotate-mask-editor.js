@@ -45924,6 +45924,8 @@ const PANEL_ROW_EYE_CLOSED_SVG = `<svg width="14" height="14" viewBox="0 0 24 24
 const PANEL_ROW_ISO_OFF_SVG = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/></svg>`;
 const PANEL_ROW_ISO_ONLY_SVG = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 3h18v18H3z" opacity="0.25"/><circle cx="12" cy="12" r="5" fill="currentColor" stroke="none"/><rect x="3" y="3" width="18" height="18" rx="2"/></svg>`;
 const PANEL_ROW_ISO_CUT_SVG = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 3h18v18H3z" fill="currentColor" fill-opacity="0.35" stroke="none"/><circle cx="12" cy="12" r="5" fill="none" stroke="currentColor" stroke-dasharray="3 2"/><rect x="3" y="3" width="18" height="18" rx="2"/></svg>`;
+/** WebGL problems are never fatal here — the 2D path always remains. */
+const WARN_GL = (...a) => console.warn("[cutout-gl]", ...a);
 const PANEL_ROW_ISO_STATES = [
   { icon: PANEL_ROW_ISO_OFF_SVG, cls: "", title: "Isolate: off — click to show only the image under this instance" },
   { icon: PANEL_ROW_ISO_ONLY_SVG, cls: " editor-panel-row-iso-only", title: "Isolate: showing only this instance's pixels — click to invert" },
@@ -46356,6 +46358,8 @@ const _EditorScreen = class _EditorScreen {
     __publicField(this, "maskTargetSelection", false);
     __publicField(this, "maskPaintingSelection", false);
     __publicField(this, "maskSelectionCanvas", null);
+    // undefined = not probed yet, null = unavailable (use the 2D path)
+    __publicField(this, "cutoutGL", void 0);
     __publicField(this, "darkModeCanvas", null);
     __publicField(this, "darkModeCacheKey", "");
     __publicField(this, "showClassesOnHover", true);
@@ -72337,6 +72341,280 @@ const _EditorScreen = class _EditorScreen {
    * Several instances can be toggled at once: isolate is a union (all isolated
    * regions stay visible) and cutout is applied on top of it.
    */
+  /* ── WebGL cutout compositing ───────────────────────────────────────
+   *
+   * Only the stencil build and the union move to the GPU. The final
+   * composite deliberately stays in Canvas 2D: a canvas cannot hold both a
+   * 2D and a WebGL context, the overlay canvas is 2D, and isolate mode needs
+   * `destination-out` against the overlay content already drawn there —
+   * which a separate GL layer stacked above could not do, since it can only
+   * paint over, never erase.
+   *
+   * What this removes: the 2D path allocated a full-resolution canvas per
+   * toggled instance and ran a per-pixel JS loop to turn each mask
+   * Uint8Array into ImageData. Here the same Uint8Array goes straight to
+   * texImage2D as a LUMINANCE texture — a memcpy, no JS loop — and the union
+   * is blend hardware instead of a second canvas.
+   */
+  /** Backdrop as normalised RGB for the shader. */
+  parseBackdropRGB() {
+    const hex = String(this.getIsolationBackdrop() || "#000000").replace("#", "");
+    if (!/^[0-9a-fA-F]{6}$/.test(hex)) return [0, 0, 0];
+    return [
+      parseInt(hex.slice(0, 2), 16) / 255,
+      parseInt(hex.slice(2, 4), 16) / 255,
+      parseInt(hex.slice(4, 6), 16) / 255
+    ];
+  }
+  initCutoutGL() {
+    try {
+      const canvas = document.createElement("canvas");
+      const opts = {
+        alpha: true,
+        premultipliedAlpha: false,
+        antialias: false,
+        depth: false,
+        stencil: false
+      };
+      const gl = canvas.getContext("webgl2", opts) || canvas.getContext("webgl", opts);
+      if (!gl) return null;
+
+      // GLSL ES 1.00 so the same source works on a webgl2 or webgl1 context.
+      const vsSrc = `
+        attribute vec2 a_pos;
+        varying vec2 v_uv;
+        void main() {
+          // Flip V: row 0 of a mask is the top of the image, texture v=0 is
+          // the first uploaded row, and clip-space y=+1 is the top of the view.
+          v_uv = vec2((a_pos.x + 1.0) * 0.5, 1.0 - (a_pos.y + 1.0) * 0.5);
+          gl_Position = vec4(a_pos, 0.0, 1.0);
+        }`;
+      const fsSrc = `
+        precision mediump float;
+        varying vec2 v_uv;
+        uniform sampler2D u_tex;
+        uniform vec4 u_chan;      // channel picker: LUMINANCE mask = R, canvas stencil = A
+        uniform vec3 u_color;
+        uniform float u_invert;   // 1.0 -> paint the complement of the mask
+        void main() {
+          float raw = dot(texture2D(u_tex, v_uv), u_chan);
+          // Mask buffers hold 0 or 1, which normalise to 0.0 or 1/255.
+          float m = step(0.002, raw);
+          m = mix(m, 1.0 - m, u_invert);
+          if (m <= 0.0) discard;
+          gl_FragColor = vec4(u_color, m);
+        }`;
+      const compile = (type, src) => {
+        const sh = gl.createShader(type);
+        gl.shaderSource(sh, src);
+        gl.compileShader(sh);
+        if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
+          WARN_GL("shader compile failed", gl.getShaderInfoLog(sh));
+          gl.deleteShader(sh);
+          return null;
+        }
+        return sh;
+      };
+      const vs = compile(gl.VERTEX_SHADER, vsSrc);
+      const fs = vs && compile(gl.FRAGMENT_SHADER, fsSrc);
+      if (!vs || !fs) return null;
+      const prog = gl.createProgram();
+      gl.attachShader(prog, vs);
+      gl.attachShader(prog, fs);
+      gl.linkProgram(prog);
+      gl.deleteShader(vs);
+      gl.deleteShader(fs);
+      if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
+        WARN_GL("program link failed", gl.getProgramInfoLog(prog));
+        return null;
+      }
+
+      const quad = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, quad);
+      gl.bufferData(
+        gl.ARRAY_BUFFER,
+        new Float32Array([-1, -1, 1, -1, -1, 1, -1, 1, 1, -1, 1, 1]),
+        gl.STATIC_DRAW
+      );
+
+      const makeTex = () => {
+        const t = gl.createTexture();
+        gl.bindTexture(gl.TEXTURE_2D, t);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+        return t;
+      };
+      const state = {
+        canvas,
+        gl,
+        prog,
+        quad,
+        stencilTex: makeTex(),
+        unionTex: makeTex(),
+        fbo: gl.createFramebuffer(),
+        locPos: gl.getAttribLocation(prog, "a_pos"),
+        locTex: gl.getUniformLocation(prog, "u_tex"),
+        locChan: gl.getUniformLocation(prog, "u_chan"),
+        locColor: gl.getUniformLocation(prog, "u_color"),
+        locInvert: gl.getUniformLocation(prog, "u_invert"),
+        maxTexture: gl.getParameter(gl.MAX_TEXTURE_SIZE) || 2048,
+        sized: ""
+      };
+      // A lost context leaves every object above invalid; drop the cache so
+      // the next frame re-initialises, and fall back to 2D meanwhile.
+      canvas.addEventListener("webglcontextlost", (e) => {
+        e.preventDefault();
+        this.cutoutGL = void 0;
+      });
+      gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+      return state;
+    } catch (err) {
+      WARN_GL("init failed", err);
+      return null;
+    }
+  }
+  getCutoutGL(imgW, imgH) {
+    if (this.cutoutGL === null) return null;        // probed once, unsupported
+    if (this.cutoutGL === void 0) {
+      this.cutoutGL = this.initCutoutGL() ?? null;
+      if (!this.cutoutGL) return null;
+    }
+    const state = this.cutoutGL;
+    const gl = state.gl;
+    if (gl.isContextLost && gl.isContextLost()) return null;
+    if (imgW > state.maxTexture || imgH > state.maxTexture) return null;
+    const key = imgW + "x" + imgH;
+    if (state.sized !== key) {
+      state.canvas.width = imgW;
+      state.canvas.height = imgH;
+      gl.bindTexture(gl.TEXTURE_2D, state.unionTex);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, imgW, imgH, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, state.fbo);
+      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, state.unionTex, 0);
+      const okFbo = gl.checkFramebufferStatus(gl.FRAMEBUFFER) === gl.FRAMEBUFFER_COMPLETE;
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      if (!okFbo) {
+        WARN_GL("framebuffer incomplete at " + key);
+        this.cutoutGL = null;
+        return null;
+      }
+      state.sized = key;
+    }
+    return state;
+  }
+  /** Draw one full-screen quad sampling `tex`. */
+  drawCutoutQuad(state, tex, chan, color, invert) {
+    const gl = state.gl;
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.uniform4fv(state.locChan, chan);
+    gl.uniform3fv(state.locColor, color);
+    gl.uniform1f(state.locInvert, invert);
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+  }
+  /**
+   * Upload one instance's region into the scratch texture and draw it.
+   * Mask instances go up as a LUMINANCE texture straight from their
+   * Uint8Array; every other type still rasterises through the 2D stencil
+   * builder (a path fill, not a per-pixel loop) and uploads as RGBA.
+   */
+  drawCutoutInstance(state, inst, imgW, imgH, color, invert) {
+    const gl = state.gl;
+    if (inst.type === "mask") {
+      const buf = this.getMaskBuffer(inst);
+      if (!buf || buf.length !== imgW * imgH) return false;
+      gl.bindTexture(gl.TEXTURE_2D, state.stencilTex);
+      gl.texImage2D(
+        gl.TEXTURE_2D, 0, gl.LUMINANCE, imgW, imgH, 0,
+        gl.LUMINANCE, gl.UNSIGNED_BYTE, buf
+      );
+      this.drawCutoutQuad(state, state.stencilTex, [1, 0, 0, 0], color, invert);
+      return true;
+    }
+    const stencil = this.buildInstanceStencil(inst, imgW, imgH);
+    if (!stencil) return false;
+    gl.bindTexture(gl.TEXTURE_2D, state.stencilTex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, stencil);
+    this.drawCutoutQuad(state, state.stencilTex, [0, 0, 0, 1], color, invert);
+    return true;
+  }
+  /**
+   * Returns false when WebGL cannot service this frame, so the caller can run
+   * the 2D path instead. Produces exactly the same two composites the 2D path
+   * does: destination-out with the isolate union, then source-over with the
+   * covered region.
+   */
+  drawInstanceIsolationGL(ctx, imgW, imgH, isolateInsts, cutoutInsts) {
+    const state = this.getCutoutGL(imgW, imgH);
+    if (!state) return false;
+    const gl = state.gl;
+    const rgb = this.parseBackdropRGB();
+    const WHITE = [1, 1, 1];
+    const CHAN_A = [0, 0, 0, 1];
+
+    try {
+      gl.viewport(0, 0, imgW, imgH);
+      gl.useProgram(state.prog);
+      gl.bindBuffer(gl.ARRAY_BUFFER, state.quad);
+      gl.enableVertexAttribArray(state.locPos);
+      gl.vertexAttribPointer(state.locPos, 2, gl.FLOAT, false, 0, 0);
+      gl.activeTexture(gl.TEXTURE0);
+      gl.uniform1i(state.locTex, 0);
+      gl.enable(gl.BLEND);
+      // Straight-alpha over-blending. Every draw uses the same colour, so
+      // overlapping regions union cleanly with no colour accumulation.
+      gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+      gl.clearColor(0, 0, 0, 0);
+
+      let drewIsolate = false;
+      if (isolateInsts.length) {
+        // 1. union the kept regions into the offscreen target
+        gl.bindFramebuffer(gl.FRAMEBUFFER, state.fbo);
+        gl.clear(gl.COLOR_BUFFER_BIT);
+        for (const inst of isolateInsts) {
+          if (this.drawCutoutInstance(state, inst, imgW, imgH, WHITE, 0)) drewIsolate = true;
+        }
+        gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+
+        if (drewIsolate) {
+          // 2. punch that union out of the overlay, revealing the raw image
+          //    and taking the class overlay with it
+          gl.clear(gl.COLOR_BUFFER_BIT);
+          this.drawCutoutQuad(state, state.unionTex, CHAN_A, WHITE, 0);
+          ctx.globalCompositeOperation = "destination-out";
+          ctx.drawImage(state.canvas, 0, 0, imgW, imgH);
+        }
+      }
+
+      // 3. cover everything outside the isolate union, plus every cutout region
+      gl.clear(gl.COLOR_BUFFER_BIT);
+      let anyCovered = false;
+      if (drewIsolate) {
+        this.drawCutoutQuad(state, state.unionTex, CHAN_A, rgb, 1);
+        anyCovered = true;
+      }
+      for (const inst of cutoutInsts) {
+        if (this.drawCutoutInstance(state, inst, imgW, imgH, rgb, 0)) anyCovered = true;
+      }
+      if (anyCovered) {
+        ctx.globalCompositeOperation = "source-over";
+        ctx.drawImage(state.canvas, 0, 0, imgW, imgH);
+      }
+      return true;
+    } catch (err) {
+      WARN_GL("draw failed, falling back to 2D", err);
+      this.cutoutGL = null;
+      return false;
+    }
+  }
+  /** Cheap type check: can this instance produce a stencil at all? */
+  instanceHasStencil(inst) {
+    if (inst.type === "mask") return true;
+    if (inst.type === "polygon") return !!(inst.points && inst.points.length >= 3);
+    const b = inst.bbox;
+    return !!(b && b.width > 0 && b.height > 0);
+  }
   drawInstanceIsolation(ctx, imgW, imgH) {
     if (!this.isolatedInstanceIds || this.isolatedInstanceIds.size === 0) return;
     if (!imgW || !imgH) return;
@@ -72351,14 +72629,31 @@ const _EditorScreen = class _EditorScreen {
         continue;
       }
       if (this.hiddenInstanceIds.has(instId)) continue;
-      const stencil = this.buildInstanceStencil(inst, imgW, imgH);
-      if (!stencil) continue;
-      (mode === 2 ? cutout : isolate).push(stencil);
+      if (!this.instanceHasStencil(inst)) continue;
+      (mode === 2 ? cutout : isolate).push(inst);
     }
     if (!isolate.length && !cutout.length) return;
 
-    const backdrop = this.getIsolationBackdrop();
     ctx.save();
+    if (!this.drawInstanceIsolationGL(ctx, imgW, imgH, isolate, cutout)) {
+      this.drawInstanceIsolation2D(ctx, imgW, imgH, isolate, cutout);
+    }
+    ctx.restore();
+  }
+  /**
+   * Canvas 2D fallback — the original implementation, used whenever WebGL is
+   * unavailable, the context is lost, or the frame exceeds MAX_TEXTURE_SIZE.
+   */
+  drawInstanceIsolation2D(ctx, imgW, imgH, isolateInsts, cutoutInsts) {
+    const backdrop = this.getIsolationBackdrop();
+    const stencils = (list) => list
+      .map((inst) => this.buildInstanceStencil(inst, imgW, imgH))
+      .filter(Boolean);
+
+    const isolate = stencils(isolateInsts);
+    const cutout = stencils(cutoutInsts);
+    if (!isolate.length && !cutout.length) return;
+
     if (isolate.length) {
       // Union the regions to keep, so one backdrop pass covers everything else.
       const keep = document.createElement("canvas");
@@ -72385,7 +72680,6 @@ const _EditorScreen = class _EditorScreen {
       tctx.fillRect(0, 0, imgW, imgH);
       ctx.drawImage(tint, 0, 0);
     }
-    ctx.restore();
   }
   /** Cycle one instance through off -> isolate -> cutout -> off. */
   cycleInstanceIsolation(instId) {
