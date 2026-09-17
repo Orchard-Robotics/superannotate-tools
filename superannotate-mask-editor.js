@@ -47554,6 +47554,7 @@ const _EditorScreen = class _EditorScreen {
                         </div>
                         <img id="editor-image" alt="Annotation image" />
                         <canvas id="editor-overlay" aria-hidden="true"></canvas>
+                        <canvas id="editor-cutout" aria-hidden="true" hidden></canvas>
                         <div class="editor-drop-overlay" id="editor-drop-overlay" hidden>Drop image here</div>
                         <div class="editor-keypoint-hint" id="editor-keypoint-hint" hidden>
                             <button type="button" class="editor-keypoint-hint-btn" id="editor-keypoint-hint-prev" title="Previous point (,)" aria-label="Previous point">
@@ -71438,6 +71439,10 @@ const _EditorScreen = class _EditorScreen {
     for (const inst of this.instances) {
       if (this.hiddenInstanceIds.has(inst.id)) continue;
       if (this.isAnnotationFilteredOut(inst, this.activeImageId ?? void 0)) continue;
+      // Isolate mode shows the raw pixels under an instance. The cutout layer
+      // composites above this canvas, so it cannot erase what is drawn here —
+      // the overlay is suppressed at the source instead.
+      if (this.isolatedInstanceIds.get(inst.id) === 1) continue;
       const cls = classMap.get(inst.classId);
       const color = this.getEffectiveClassColor(inst);
       const selected = this.selectedIds.has(inst.id);
@@ -72368,7 +72373,10 @@ const _EditorScreen = class _EditorScreen {
   }
   initCutoutGL() {
     try {
-      const canvas = document.createElement("canvas");
+      // The live DOM canvas, stacked above #editor-overlay. Compositing it is
+      // the browser's job, so nothing is ever copied back into the 2D context.
+      const canvas = this.root ? this.root.querySelector("#editor-cutout") : null;
+      if (!canvas) return null;
       const opts = {
         alpha: true,
         premultipliedAlpha: false,
@@ -72461,8 +72469,7 @@ const _EditorScreen = class _EditorScreen {
         prog,
         quad,
         stencilTex: makeTex(),
-        unionTex: makeTex(),
-        fbo: gl.createFramebuffer(),
+        solidTex: makeTex(),
         locPos: gl.getAttribLocation(prog, "a_pos"),
         locTex: gl.getUniformLocation(prog, "u_tex"),
         locChan: gl.getUniformLocation(prog, "u_chan"),
@@ -72479,6 +72486,12 @@ const _EditorScreen = class _EditorScreen {
         this.cutoutGL = void 0;
       });
       gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+      // 1x1 opaque texture, used as the source for full-coverage fills.
+      gl.bindTexture(gl.TEXTURE_2D, state.solidTex);
+      gl.texImage2D(
+        gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE,
+        new Uint8Array([255, 255, 255, 255])
+      );
       return state;
     } catch (err) {
       WARN_GL("init failed", err);
@@ -72497,19 +72510,11 @@ const _EditorScreen = class _EditorScreen {
     if (imgW > state.maxTexture || imgH > state.maxTexture) return null;
     const key = imgW + "x" + imgH;
     if (state.sized !== key) {
+      // Backing store in image pixels; CSS then scales it to the viewport, so
+      // the browser does the zoom on the GPU and nothing is ever resampled
+      // through the 2D context.
       state.canvas.width = imgW;
       state.canvas.height = imgH;
-      gl.bindTexture(gl.TEXTURE_2D, state.unionTex);
-      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, imgW, imgH, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
-      gl.bindFramebuffer(gl.FRAMEBUFFER, state.fbo);
-      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, state.unionTex, 0);
-      const okFbo = gl.checkFramebufferStatus(gl.FRAMEBUFFER) === gl.FRAMEBUFFER_COMPLETE;
-      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-      if (!okFbo) {
-        WARN_GL("framebuffer incomplete at " + key);
-        this.cutoutGL = null;
-        return null;
-      }
       state.sized = key;
     }
     return state;
@@ -72555,20 +72560,63 @@ const _EditorScreen = class _EditorScreen {
     return true;
   }
   /**
+   * Place the cutout layer over the image.
+   *
+   * Reuses applyViewportToImage's geometry verbatim — CSS size of natural x
+   * scale, left/top from the viewport offset, and a rotate() transform — so
+   * the layer tracks the image without duplicating any transform maths, and
+   * the browser applies it on the GPU.
+   */
+  positionCutoutLayer(canvas, imgW, imgH) {
+    const s2 = this.viewport.scale;
+    const rot = this.viewport.rotation;
+    const st = canvas.style;
+    st.position = "absolute";
+    st.pointerEvents = "none";
+    st.width = imgW * s2 + "px";
+    st.height = imgH * s2 + "px";
+    if (rot === 90 || rot === 270) {
+      st.left = this.viewport.offsetX + (imgH - imgW) * s2 / 2 + "px";
+      st.top = this.viewport.offsetY + (imgW - imgH) * s2 / 2 + "px";
+    } else {
+      st.left = this.viewport.offsetX + "px";
+      st.top = this.viewport.offsetY + "px";
+    }
+    st.transform = rot ? `rotate(${rot}deg)` : "";
+    st.transformOrigin = "50% 50%";
+  }
+  /** Hide the layer when nothing is toggled, so it never tints an idle view. */
+  hideCutoutLayer() {
+    const state = this.cutoutGL;
+    if (state && state.canvas && !state.canvas.hidden) state.canvas.hidden = true;
+  }
+  /**
    * Returns false when WebGL cannot service this frame, so the caller can run
    * the 2D path instead. Produces exactly the same two composites the 2D path
    * does: destination-out with the isolate union, then source-over with the
    * covered region.
    */
-  drawInstanceIsolationGL(ctx, imgW, imgH, isolateInsts, cutoutInsts) {
+  /**
+   * Render straight into the stacked canvas — no readback, no drawImage, no
+   * copy of any kind. Returns false when WebGL cannot service this frame so
+   * the caller can fall back to the 2D path.
+   *
+   * Isolate no longer needs to erase the 2D overlay (that instance's overlay
+   * is suppressed at the source), so the whole thing is one pass:
+   *   1. flood the layer with the backdrop,
+   *   2. erase the isolate union out of it with a destination-out blend,
+   *   3. paint the cutout regions back over the top.
+   * Step 2 is what makes the isolated pixels show through to the image below.
+   */
+  drawInstanceIsolationGL(imgW, imgH, isolateInsts, cutoutInsts) {
     const state = this.getCutoutGL(imgW, imgH);
     if (!state) return false;
     const gl = state.gl;
     const rgb = this.parseBackdropRGB();
     const WHITE = [1, 1, 1];
-    const CHAN_A = [0, 0, 0, 1];
 
     try {
+      this.positionCutoutLayer(state.canvas, imgW, imgH);
       gl.viewport(0, 0, imgW, imgH);
       gl.useProgram(state.prog);
       gl.bindBuffer(gl.ARRAY_BUFFER, state.quad);
@@ -72577,45 +72625,29 @@ const _EditorScreen = class _EditorScreen {
       gl.activeTexture(gl.TEXTURE0);
       gl.uniform1i(state.locTex, 0);
       gl.enable(gl.BLEND);
-      // Straight-alpha over-blending. Every draw uses the same colour, so
-      // overlapping regions union cleanly with no colour accumulation.
-      gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
       gl.clearColor(0, 0, 0, 0);
-
-      let drewIsolate = false;
-      if (isolateInsts.length) {
-        // 1. union the kept regions into the offscreen target
-        gl.bindFramebuffer(gl.FRAMEBUFFER, state.fbo);
-        gl.clear(gl.COLOR_BUFFER_BIT);
-        for (const inst of isolateInsts) {
-          if (this.drawCutoutInstance(state, inst, imgW, imgH, WHITE, 0)) drewIsolate = true;
-        }
-        gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-
-        if (drewIsolate) {
-          // 2. punch that union out of the overlay, revealing the raw image
-          //    and taking the class overlay with it
-          gl.clear(gl.COLOR_BUFFER_BIT);
-          this.drawCutoutQuad(state, state.unionTex, CHAN_A, WHITE, 0, 0);
-          ctx.globalCompositeOperation = "destination-out";
-          ctx.drawImage(state.canvas, 0, 0, imgW, imgH);
-        }
-      }
-
-      // 3. cover everything outside the isolate union, plus every cutout region
       gl.clear(gl.COLOR_BUFFER_BIT);
-      let anyCovered = false;
-      if (drewIsolate) {
-        this.drawCutoutQuad(state, state.unionTex, CHAN_A, rgb, 1, 0);
-        anyCovered = true;
+
+      let painted = false;
+      if (isolateInsts.length) {
+        // 1. backdrop everywhere
+        gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+        this.drawCutoutQuad(state, state.solidTex, [0, 0, 0, 1], rgb, 0);
+        // 2. dst = dst * (1 - srcAlpha): GL's destination-out, punching the
+        //    kept regions back out so the image below shows through
+        gl.blendFuncSeparate(gl.ZERO, gl.ONE_MINUS_SRC_ALPHA, gl.ZERO, gl.ONE_MINUS_SRC_ALPHA);
+        for (const inst of isolateInsts) {
+          this.drawCutoutInstance(state, inst, imgW, imgH, WHITE, 0);
+        }
+        painted = true;
       }
+      // 3. cutout regions, over the top so they win inside an isolated area
+      gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
       for (const inst of cutoutInsts) {
-        if (this.drawCutoutInstance(state, inst, imgW, imgH, rgb, 0)) anyCovered = true;
+        if (this.drawCutoutInstance(state, inst, imgW, imgH, rgb, 0)) painted = true;
       }
-      if (anyCovered) {
-        ctx.globalCompositeOperation = "source-over";
-        ctx.drawImage(state.canvas, 0, 0, imgW, imgH);
-      }
+
+      state.canvas.hidden = !painted;
       return true;
     } catch (err) {
       WARN_GL("draw failed, falling back to 2D", err);
@@ -72631,7 +72663,10 @@ const _EditorScreen = class _EditorScreen {
     return !!(b && b.width > 0 && b.height > 0);
   }
   drawInstanceIsolation(ctx, imgW, imgH) {
-    if (!this.isolatedInstanceIds || this.isolatedInstanceIds.size === 0) return;
+    if (!this.isolatedInstanceIds || this.isolatedInstanceIds.size === 0) {
+      this.hideCutoutLayer();
+      return;
+    }
     if (!imgW || !imgH) return;
 
     const isolate = [];
@@ -72647,12 +72682,16 @@ const _EditorScreen = class _EditorScreen {
       if (!this.instanceHasStencil(inst)) continue;
       (mode === 2 ? cutout : isolate).push(inst);
     }
-    if (!isolate.length && !cutout.length) return;
-
-    ctx.save();
-    if (!this.drawInstanceIsolationGL(ctx, imgW, imgH, isolate, cutout)) {
-      this.drawInstanceIsolation2D(ctx, imgW, imgH, isolate, cutout);
+    if (!isolate.length && !cutout.length) {
+      this.hideCutoutLayer();
+      return;
     }
+
+    if (this.drawInstanceIsolationGL(imgW, imgH, isolate, cutout)) return;
+
+    this.hideCutoutLayer();
+    ctx.save();
+    this.drawInstanceIsolation2D(ctx, imgW, imgH, isolate, cutout);
     ctx.restore();
   }
   /**
