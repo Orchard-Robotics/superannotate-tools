@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Mask Editor — local test</title>
+    <link rel="stylesheet" href="./superannotate-index.css" />
+    <style>
+      html, body { margin: 0; padding: 0; min-height: 100%; }
+      #sa-container { min-height: 100vh; }
+      /* Boot diagnostics. The bundle is host-driven, so a blank page is the
+         likely first result; this makes the reason visible instead. */
+      #boot-log {
+        position: fixed; right: 12px; bottom: 12px; z-index: 99999;
+        max-width: min(560px, 90vw); max-height: 45vh; overflow: auto;
+        font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+        background: #14161a; color: #e8e8ea; border: 1px solid #333a45;
+        border-radius: 8px; padding: 10px 12px; white-space: pre-wrap;
+      }
+      #boot-log:empty { display: none; }
+      #boot-log .err { color: #ff6b6b; }
+      #boot-log .warn { color: #fbbf24; }
+      #boot-log h4 { margin: 0 0 6px; font-size: 12px; color: #9aa4b2; }
+      #mode-bar {
+        position: fixed; left: 12px; bottom: 12px; z-index: 99999;
+        font: 12px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+        background: #14161a; color: #e8e8ea; border: 1px solid #333a45;
+        border-radius: 8px; padding: 8px 10px;
+      }
+      #mode-bar a { color: #6ea8fe; margin-left: 8px; text-decoration: none; }
+      #mode-bar a.on { color: #4ade80; font-weight: 700; }
+    </style>
+  </head>
+  <body>
+    <!-- ImageAnnotationToolComponent throws without this element. -->
+    <div id="sa-container"></div>
+
+    <div id="mode-bar"></div>
+    <div id="boot-log"></div>
+
+    <script>
+      /* The bundle picks its mode from globals and boots when SA_READY fires:
+       *   working = !IS_BUILDER && !IS_CONFIG_MODE   (full editor)
+       *   preview =  IS_BUILDER && !IS_CONFIG_MODE
+       *   config  =  IS_BUILDER &&  IS_CONFIG_MODE   (class/config builder)
+       * IS_SA_READY makes init() call SA_READY() immediately instead of
+       * waiting for the host to call it.
+       */
+      var mode = new URLSearchParams(location.search).get('mode') || 'working';
+      window.IS_BUILDER = mode !== 'working';
+      window.IS_CONFIG_MODE = mode === 'config';
+      window.IS_SA_READY = true;
+
+      var bar = document.getElementById('mode-bar');
+      bar.innerHTML = 'mode:' + ['working', 'preview', 'config']
+        .map(function (m) {
+          return '<a class="' + (m === mode ? 'on' : '') + '" href="?mode=' + m + '">' + m + '</a>';
+        }).join('');
+
+      var log = document.getElementById('boot-log');
+      function say(cls, msg) {
+        if (!log.firstChild) log.innerHTML = '<h4>boot log</h4>';
+        var d = document.createElement('div');
+        d.className = cls;
+        d.textContent = msg;
+        log.appendChild(d);
+      }
+      say('', 'mode = ' + mode);
+      // local-sa-stub.js supplies SA / SALIB / SA_SDK; it loads further down,
+      // so only report a problem if it never arrives.
+      window.addEventListener('DOMContentLoaded', function () {
+        if (!window.SA_SDK || !window.SA || !window.SALIB) {
+          say('err', 'Host globals missing — local-sa-stub.js did not load. ' +
+                     'The bundle throws at import time without SA, SALIB and SA_SDK.');
+        } else {
+          say('', 'stub installed: SA, SALIB, SA_SDK');
+        }
+      });
+      window.addEventListener('error', function (e) {
+        say('err', 'error: ' + (e.message || e.error) +
+          (e.filename ? '  @ ' + e.filename.split('/').pop() + ':' + e.lineno : ''));
+      });
+      window.addEventListener('unhandledrejection', function (e) {
+        var r = e.reason;
+        say('err', 'unhandled rejection: ' + ((r && (r.stack || r.message)) || r));
+      });
+      // The lazy TipTap chunks (assets/index3..12.js, assets/core.js) are not
+      // in this repo; opening a rich-text field will reject here.
+      setTimeout(function () {
+        if (!document.querySelector('.editor-screen')) {
+          say('warn', 'No .editor-screen after 3s — the bundle loaded but did not mount. ' +
+                      'Check the errors above; most likely the missing host SDK.');
+        } else {
+          say('', 'editor-screen mounted');
+        }
+      }, 3000);
+    </script>
+
+    <!-- Host globals (SA, SALIB, SA_SDK) must exist BEFORE the module is
+         evaluated: the bundle throws at import time without them. Classic
+         script, so it runs first. -->
+    <script src="./local-sa-stub.js"></script>
+
+    <!-- Must be type="module": the bundle is an ES module and self-boots. -->
+    <script type="module" src="./superannotate-mask-editor.js"></script>
+  </body>
+</html>
