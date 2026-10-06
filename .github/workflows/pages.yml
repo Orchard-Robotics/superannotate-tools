@@ -27,8 +27,6 @@ on:
 
 permissions:
   contents: read
-  pages: write
-  id-token: write
 
 # Let a run in progress finish rather than cancelling it — a half-applied
 # deployment would leave the site serving a mix of old and new files.
@@ -38,9 +36,14 @@ concurrency:
 
 jobs:
   build:
+    permissions:
+      contents: read
+      pages: read
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Assemble the site
         run: |
@@ -76,6 +79,10 @@ jobs:
           path: _site
 
   deploy:
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
     needs: build
     runs-on: ubuntu-latest
     environment:

@@ -95,3 +95,8 @@ updates** — or just click the install link above again.
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+## Dependency maintenance
+
+Dependabot checks the GitHub Actions dependencies used by this repository
+weekly. Review updates through pull requests before merging.
